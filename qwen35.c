@@ -427,11 +427,16 @@ void forward_attention_layer(Qwen35* model, int l, int la, int pos) {
     Weights* w = &model->weights;
     RunState* s = &model->state;
     float *x = s->x;
-    int dim = p->dim;
-    int head_size = p->d_head > 0 ? p->d_head : dim / p->n_heads;
-    int kv_dim = p->n_kv_heads * head_size;
-    int kv_mul = p->n_heads / p->n_kv_heads;
-    float eps = p->rms_norm_eps;
+    int dim          = p->dim;
+    int head_size    = p->d_head > 0 ? p->d_head : dim / p->n_heads;
+    int kv_dim       = p->n_kv_heads * head_size;
+    int q_dim        = p->n_heads * head_size * 2;  // packs [q | gate] per head
+    int attn_out_dim = p->n_heads * head_size;
+    int kv_mul       = p->n_heads / p->n_kv_heads;
+    int loff         = l * p->seq_len * kv_dim;
+    float eps        = p->rms_norm_eps;
+    float* key_cache_row   = s->key_cache   + loff + pos * kv_dim;
+    float* value_cache_row = s->value_cache + loff + pos * kv_dim;
 
 #ifdef DEBUG_ATTN
     if (l == 3) {
@@ -440,14 +445,16 @@ void forward_attention_layer(Qwen35* model, int l, int la, int pos) {
     }
 #endif
 
+    // weights for this layer
     float* rms_att_weight = w->rms_att_weight + (long long)l  * dim;
-    float* wq             = w->wq             + (long long)la * dim * (p->n_heads * head_size * 2);
+    float* wq             = w->wq             + (long long)la * dim * q_dim;
     float* wk             = w->wk             + (long long)la * dim * kv_dim;
     float* wv             = w->wv             + (long long)la * dim * kv_dim;
-    float* wo             = w->wo             + (long long)la * (p->n_heads * head_size) * dim;
+    float* wo             = w->wo             + (long long)la * attn_out_dim * dim;
     float* q_norm         = w->q_norm         + (long long)la * head_size;
     float* k_norm         = w->k_norm         + (long long)la * head_size;
 
+    // pre-attention norm
     gemma_rmsnorm(s->xb, x, rms_att_weight, dim, eps);
 
 #ifdef DEBUG_ATTN
@@ -457,7 +464,7 @@ void forward_attention_layer(Qwen35* model, int l, int la, int pos) {
     }
 #endif
 
-    int q_dim = p->n_heads * head_size * 2;
+    // QKV projections; wq output is [q | gate] interleaved per head
     matmul(s->q, s->xb, wq, dim, q_dim);
     matmul(s->k, s->xb, wk, dim, kv_dim);
     matmul(s->v, s->xb, wv, dim, kv_dim);
@@ -473,6 +480,7 @@ void forward_attention_layer(Qwen35* model, int l, int la, int pos) {
     }
 #endif
 
+    // split q into [q, gate] per head, apply per-head RMSNorm to q
     for (int h = 0; h < p->n_heads; h++) {
         float* q_ptr = s->q + h * head_size;
         float* gate_ptr = s->gate + h * head_size;
@@ -483,11 +491,13 @@ void forward_attention_layer(Qwen35* model, int l, int la, int pos) {
         gemma_rmsnorm(q_ptr, q_ptr, q_norm, head_size, eps);
     }
 
+    // apply per-head RMSNorm to k
     for (int h = 0; h < p->n_kv_heads; h++) {
         float* k_ptr = s->k + h * head_size;
         gemma_rmsnorm(k_ptr, k_ptr, k_norm, head_size, eps);
     }
 
+    // RoPE rotary positional embeddings on q and k
     float theta = p->rope_theta;
     for (int i = 0; i < head_size; i+=2) {
         float freq = 1.0f / powf(theta, (float)i / head_size);
@@ -520,18 +530,18 @@ void forward_attention_layer(Qwen35* model, int l, int la, int pos) {
     }
 #endif
 
-    int loff = l * p->seq_len * kv_dim;
-    float* key_cache_row   = s->key_cache   + loff + pos * kv_dim;
-    float* value_cache_row = s->value_cache + loff + pos * kv_dim;
+    // store k/v into the KV cache for this position
     memcpy(key_cache_row,   s->k, kv_dim * sizeof(float));
     memcpy(value_cache_row, s->v, kv_dim * sizeof(float));
 
+    // multi-head attention
     int h;
     #pragma omp parallel for private(h)
     for (h = 0; h < p->n_heads; h++) {
         float* q = s->q + h * head_size;
         float* att = s->att + h * p->seq_len;
 
+        // dot-product scores, scaled
         for (int t = 0; t <= pos; t++) {
             float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
             float score = 0.0f;
@@ -542,8 +552,10 @@ void forward_attention_layer(Qwen35* model, int l, int la, int pos) {
             att[t] = score;
         }
 
+        // softmax over scores
         softmax(att, pos + 1);
 
+        // weighted sum of values
         float* xb = s->xb + h * head_size;
         memset(xb, 0, head_size * sizeof(float));
         for (int t = 0; t <= pos; t++) {
@@ -554,6 +566,7 @@ void forward_attention_layer(Qwen35* model, int l, int la, int pos) {
             }
         }
 
+        // gated output
         float* gate_ptr = s->gate + h * head_size;
         for (int i = 0; i < head_size; i++) {
             xb[i] *= sigmoid(gate_ptr[i]);
@@ -567,7 +580,7 @@ void forward_attention_layer(Qwen35* model, int l, int la, int pos) {
     }
 #endif
 
-    int attn_out_dim = p->n_heads * head_size;
+    // output projection
     matmul(s->xb2, s->xb, wo, attn_out_dim, dim);
 
 #ifdef DEBUG_ATTN
@@ -577,6 +590,7 @@ void forward_attention_layer(Qwen35* model, int l, int la, int pos) {
     }
 #endif
 
+    // add to residual
     for (int i = 0; i < dim; i++) {
         x[i] += s->xb2[i];
     }
@@ -600,6 +614,7 @@ void forward_linear_attention_layer(Qwen35* model, int l, int ld, int pos) {
     int conv_dim = key_dim * 2 + value_dim;
     int conv_kernel = p->linear_conv_kernel;
 
+    // weights for this layer
     float* rms_att_weight = w->rms_att_weight + (long long)l  * dim;
     float* in_proj_qkv    = w->in_proj_qkv    + (long long)ld * conv_dim * dim;
     float* in_proj_z      = w->in_proj_z      + (long long)ld * value_dim * dim;
@@ -611,21 +626,26 @@ void forward_linear_attention_layer(Qwen35* model, int l, int ld, int pos) {
     float* linear_norm    = w->linear_norm    + (long long)ld * d_v;
     float* out_proj       = w->out_proj       + (long long)ld * dim * value_dim;
 
+    // pre-attention norm
     gemma_rmsnorm(s->xb, x, rms_att_weight, dim, eps);
 
+    // project to qkv (pre-conv) and z (value gate)
     matmul(s->qkv, s->xb, in_proj_qkv, dim, conv_dim);
     matmul(s->z, s->xb, in_proj_z, dim, value_dim);
 
+    // beta (write strength) per head
     for (int i = 0; i < n_v_heads; i++) {
         s->beta[i] = sigmoid(matmul_scalar(s->xb, in_proj_b + i * dim, dim));
     }
 
+    // g (decay rate) per head: g = A * softplus(a + dt_bias), A < 0
     for (int i = 0; i < n_v_heads; i++) {
         float a_val = matmul_scalar(s->xb, in_proj_a + i * dim, dim);
         float A = -expf(A_log[i]);
         s->g[i] = A * softplus(a_val + dt_bias[i]);
     }
 
+    // shift conv state buffer and apply depthwise conv1d + SiLU to qkv
     float* conv_state = s->conv_state + l * conv_dim * conv_kernel;
     for (int i = 0; i < conv_dim; i++) {
         for (int j = 0; j < conv_kernel - 1; j++) {
@@ -634,6 +654,7 @@ void forward_linear_attention_layer(Qwen35* model, int l, int ld, int pos) {
         conv_state[i * conv_kernel + conv_kernel - 1] = s->qkv[i];
     }
 
+    // apply conv weights and SiLU
     float* qkv_conv = s->qkv;
     for (int i = 0; i < conv_dim; i++) {
         float val = 0.0f;
@@ -643,12 +664,14 @@ void forward_linear_attention_layer(Qwen35* model, int l, int ld, int pos) {
         qkv_conv[i] = silu(val);
     }
 
+    // split conv output into q, k, v
     float* q = qkv_conv;
     float* k = qkv_conv + key_dim;
     float* v = qkv_conv + key_dim * 2;
 
     float scale = 1.0f / sqrtf((float)d_k);
 
+    // expand q/k heads to match n_v_heads if using GQA (n_v_heads > n_k_heads)
     float* q_work = q;
     float* k_work = k;
     if (n_v_heads > n_k_heads) {
@@ -668,6 +691,7 @@ void forward_linear_attention_layer(Qwen35* model, int l, int ld, int pos) {
         k_work = k_expanded;
     }
 
+    // L2-normalize q and k per head, scale q
     for (int h = 0; h < n_v_heads; h++) {
         l2norm(q_work + h * d_k, d_k);
         for (int i = 0; i < d_k; i++) {
@@ -676,6 +700,7 @@ void forward_linear_attention_layer(Qwen35* model, int l, int ld, int pos) {
         l2norm(k_work + h * d_k, d_k);
     }
 
+    // linear attention state update per head: decay S, delta rule write, then read out
     float* S = s->S + l * n_v_heads * d_k * d_v;
 
     for (int h = 0; h < n_v_heads; h++) {
@@ -687,10 +712,12 @@ void forward_linear_attention_layer(Qwen35* model, int l, int ld, int pos) {
         float* k_h = k_work + h * d_k;
         float* v_h = v + h * d_v;
 
+        // decay state
         for (int i = 0; i < d_k * d_v; i++) {
             S_h[i] *= g_t;
         }
 
+        // delta = (v - S*k) * beta
         float* delta = s->delta_S + h * d_v;
         for (int j = 0; j < d_v; j++) {
             float dot = 0.0f;
@@ -700,12 +727,14 @@ void forward_linear_attention_layer(Qwen35* model, int l, int ld, int pos) {
             delta[j] = (v_h[j] - dot) * beta_t;
         }
 
+        // S += k outer delta
         for (int i = 0; i < d_k; i++) {
             for (int j = 0; j < d_v; j++) {
                 S_h[i * d_v + j] += k_h[i] * delta[j];
             }
         }
 
+        // out = S * q
         float* out_h = s->linear_out + h * d_v;
         for (int j = 0; j < d_v; j++) {
             float val = 0.0f;
@@ -716,10 +745,13 @@ void forward_linear_attention_layer(Qwen35* model, int l, int ld, int pos) {
         }
     }
 
+    // gated RMSNorm
     rmsnorm_gated(s->linear_out, s->linear_out, s->z, linear_norm, n_v_heads, d_v, eps);
 
+    // output projection
     matmul(s->xb, s->linear_out, out_proj, value_dim, dim);
 
+    // add to residual
     for (int i = 0; i < dim; i++) {
         x[i] += s->xb[i];
     }
@@ -734,16 +766,20 @@ void forward_mlp_layer(Qwen35* model, int l) {
     int hidden_dim = p->n_mlp;
     float eps = p->rms_norm_eps;
 
+    // weights for this layer
     float* rms_ffn_weight = w->rms_ffn_weight + (long long)l * dim;
     float* w1             = w->w1             + (long long)l * dim * hidden_dim;
     float* w3             = w->w3             + (long long)l * dim * hidden_dim;
     float* w2             = w->w2             + (long long)l * hidden_dim * dim;
 
+    // pre-FFN norm
     gemma_rmsnorm(s->xb, x, rms_ffn_weight, dim, eps);
 
+    // gate (w1) and up (w3) projections
     matmul(s->hb,  s->xb, w1, dim, hidden_dim);
     matmul(s->hb2, s->xb, w3, dim, hidden_dim);
 
+    // SwiGLU: silu(gate) * up
     for (int i = 0; i < hidden_dim; i++) {
         float val = s->hb[i];
         val *= (1.0f / (1.0f + expf(-val)));
@@ -751,8 +787,10 @@ void forward_mlp_layer(Qwen35* model, int l) {
         s->hb[i] = val;
     }
 
+    // down projection
     matmul(s->xb, s->hb, w2, hidden_dim, dim);
 
+    // add to residual
     for (int i = 0; i < dim; i++) {
         x[i] += s->xb[i];
     }
@@ -765,6 +803,7 @@ float* forward(Qwen35* model, int token, int pos) {
     float *x = s->x;
     int dim = p->dim;
 
+    // token embedding lookup
     float* content_row = w->token_embedding_table + token * dim;
     memcpy(x, content_row, dim * sizeof(float));
 
@@ -773,6 +812,7 @@ float* forward(Qwen35* model, int token, int pos) {
             x[0], x[1], x[2], x[3], x[4]);
 #endif
 
+    // transformer layers: attention (or linear attention) + MLP
     int la = 0, ld = 0;
     for (unsigned long long l = 0; l < p->n_layer; l++) {
         int layer_type = model->layer_types[l];
@@ -800,6 +840,7 @@ float* forward(Qwen35* model, int token, int pos) {
             x[0], x[1], x[2], x[3], x[4]);
 #endif
 
+    // final norm
     gemma_rmsnorm(x, x, w->rms_final_weight, dim, p->rms_norm_eps);
 
 #ifdef DEBUG_FORWARD
@@ -807,6 +848,7 @@ float* forward(Qwen35* model, int token, int pos) {
             x[0], x[1], x[2], x[3], x[4]);
 #endif
 
+    // project to logits
     matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
     return s->logits;
 }
