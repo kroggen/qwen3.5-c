@@ -440,14 +440,15 @@ void forward_attention_layer(Qwen35* model, int l, int la, int pos) {
     }
 #endif
 
-    float* wq = w->wq + (long long)la * dim * (p->n_heads * head_size * 2);
-    float* wk = w->wk + (long long)la * dim * kv_dim;
-    float* wv = w->wv + (long long)la * dim * kv_dim;
-    float* wo = w->wo + (long long)la * (p->n_heads * head_size) * dim;
-    float* q_norm = w->q_norm + (long long)la * head_size;
-    float* k_norm = w->k_norm + (long long)la * head_size;
+    float* rms_att_weight = w->rms_att_weight + (long long)l  * dim;
+    float* wq             = w->wq             + (long long)la * dim * (p->n_heads * head_size * 2);
+    float* wk             = w->wk             + (long long)la * dim * kv_dim;
+    float* wv             = w->wv             + (long long)la * dim * kv_dim;
+    float* wo             = w->wo             + (long long)la * (p->n_heads * head_size) * dim;
+    float* q_norm         = w->q_norm         + (long long)la * head_size;
+    float* k_norm         = w->k_norm         + (long long)la * head_size;
 
-    gemma_rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim, eps);
+    gemma_rmsnorm(s->xb, x, rms_att_weight, dim, eps);
 
 #ifdef DEBUG_ATTN
     if (l == 3) {
@@ -520,9 +521,9 @@ void forward_attention_layer(Qwen35* model, int l, int la, int pos) {
 #endif
 
     int loff = l * p->seq_len * kv_dim;
-    float* key_cache_row = s->key_cache + loff + pos * kv_dim;
+    float* key_cache_row   = s->key_cache   + loff + pos * kv_dim;
     float* value_cache_row = s->value_cache + loff + pos * kv_dim;
-    memcpy(key_cache_row, s->k, kv_dim * sizeof(float));
+    memcpy(key_cache_row,   s->k, kv_dim * sizeof(float));
     memcpy(value_cache_row, s->v, kv_dim * sizeof(float));
 
     int h;
@@ -599,17 +600,18 @@ void forward_linear_attention_layer(Qwen35* model, int l, int ld, int pos) {
     int conv_dim = key_dim * 2 + value_dim;
     int conv_kernel = p->linear_conv_kernel;
 
-    float* in_proj_qkv = w->in_proj_qkv + (long long)ld * conv_dim * dim;
-    float* in_proj_z = w->in_proj_z + (long long)ld * value_dim * dim;
-    float* in_proj_b = w->in_proj_b + (long long)ld * n_v_heads * dim;
-    float* in_proj_a = w->in_proj_a + (long long)ld * n_v_heads * dim;
-    float* conv1d_weight = w->conv1d_weight + (long long)ld * conv_dim * conv_kernel;
-    float* dt_bias = w->dt_bias + (long long)ld * n_v_heads;
-    float* A_log = w->A_log + (long long)ld * n_v_heads;
-    float* linear_norm = w->linear_norm + (long long)ld * d_v;
-    float* out_proj = w->out_proj + (long long)ld * dim * value_dim;
+    float* rms_att_weight = w->rms_att_weight + (long long)l  * dim;
+    float* in_proj_qkv    = w->in_proj_qkv    + (long long)ld * conv_dim * dim;
+    float* in_proj_z      = w->in_proj_z      + (long long)ld * value_dim * dim;
+    float* in_proj_b      = w->in_proj_b      + (long long)ld * n_v_heads * dim;
+    float* in_proj_a      = w->in_proj_a      + (long long)ld * n_v_heads * dim;
+    float* conv1d_weight  = w->conv1d_weight  + (long long)ld * conv_dim * conv_kernel;
+    float* dt_bias        = w->dt_bias        + (long long)ld * n_v_heads;
+    float* A_log          = w->A_log          + (long long)ld * n_v_heads;
+    float* linear_norm    = w->linear_norm    + (long long)ld * d_v;
+    float* out_proj       = w->out_proj       + (long long)ld * dim * value_dim;
 
-    gemma_rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim, eps);
+    gemma_rmsnorm(s->xb, x, rms_att_weight, dim, eps);
 
     matmul(s->qkv, s->xb, in_proj_qkv, dim, conv_dim);
     matmul(s->z, s->xb, in_proj_z, dim, value_dim);
@@ -732,10 +734,15 @@ void forward_mlp_layer(Qwen35* model, int l) {
     int hidden_dim = p->n_mlp;
     float eps = p->rms_norm_eps;
 
-    gemma_rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim, eps);
+    float* rms_ffn_weight = w->rms_ffn_weight + (long long)l * dim;
+    float* w1             = w->w1             + (long long)l * dim * hidden_dim;
+    float* w3             = w->w3             + (long long)l * dim * hidden_dim;
+    float* w2             = w->w2             + (long long)l * hidden_dim * dim;
 
-    matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-    matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+    gemma_rmsnorm(s->xb, x, rms_ffn_weight, dim, eps);
+
+    matmul(s->hb,  s->xb, w1, dim, hidden_dim);
+    matmul(s->hb2, s->xb, w3, dim, hidden_dim);
 
     for (int i = 0; i < hidden_dim; i++) {
         float val = s->hb[i];
@@ -744,7 +751,7 @@ void forward_mlp_layer(Qwen35* model, int l) {
         s->hb[i] = val;
     }
 
-    matmul(s->xb, s->hb, w->w2 + l*hidden_dim*dim, hidden_dim, dim);
+    matmul(s->xb, s->hb, w2, hidden_dim, dim);
 
     for (int i = 0; i < dim; i++) {
         x[i] += s->xb[i];
