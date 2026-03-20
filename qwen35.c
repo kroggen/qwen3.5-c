@@ -914,6 +914,66 @@ int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
     return res != NULL ? res->id : -1;
 }
 
+typedef struct {
+    const char* token;
+    int id;
+} SpecialToken;
+
+static const SpecialToken SPECIAL_TOKENS[] = {
+    {"<|endoftext|>", 248044},
+    {"<|im_start|>", 248045},
+    {"<|im_end|>", 248046},
+    {"<|object_ref_start|>", 248047},
+    {"<|object_ref_end|>", 248048},
+    {"<|box_start|>", 248049},
+    {"<|box_end|>", 248050},
+    {"<|quad_start|>", 248051},
+    {"<|quad_end|>", 248052},
+    {"<|vision_start|>", 248053},
+    {"<|vision_end|>", 248054},
+    {"<|vision_pad|>", 248055},
+    {"<|image_pad|>", 248056},
+    {"<|video_pad|>", 248057},
+    {NULL, 0}
+};
+
+void encode_segment(Tokenizer* t, char *text, int *tokens, int *n_tokens) {
+    if (text[0] == '\0') return;
+
+    char* str_buffer = malloc((t->max_token_length + 1) * sizeof(char));
+    char* pos = text;
+
+    while (*pos != '\0') {
+        int best_len = 0;
+        int best_id = -1;
+
+        for (int len = 1; len <= t->max_token_length && pos[len-1] != '\0'; len++) {
+            if ((pos[len-1] & 0xC0) == 0x80 && len < t->max_token_length && pos[len] != '\0') {
+                continue;
+            }
+
+            strncpy(str_buffer, pos, len);
+            str_buffer[len] = '\0';
+
+            int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
+            if (id != -1) {
+                best_len = len;
+                best_id = id;
+            }
+        }
+
+        if (best_id != -1) {
+            tokens[(*n_tokens)++] = best_id;
+            pos += best_len;
+        } else {
+            tokens[(*n_tokens)++] = (unsigned char)*pos + 3;
+            pos++;
+        }
+    }
+
+    free(str_buffer);
+}
+
 void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
     if (text == NULL) { fprintf(stderr, "cannot encode NULL text\n"); exit(EXIT_FAILURE); }
 
@@ -926,71 +986,51 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
         qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
     }
 
-    char* str_buffer = malloc((t->max_token_length*2 + 1 + 2) * sizeof(char));
-    size_t str_len = 0;
-
     *n_tokens = 0;
-
     if (bos) tokens[(*n_tokens)++] = 1;
 
-    if (text[0] != '\0') {
-        int dummy_prefix = str_lookup(" ", t->sorted_vocab, t->vocab_size);
-        if (dummy_prefix != -1) tokens[(*n_tokens)++] = dummy_prefix;
-    }
+    char* segment = malloc(strlen(text) + 1);
+    char* pos = text;
 
-    for (char *c = text; *c != '\0'; c++) {
-        if ((*c & 0xC0) != 0x80) {
-            str_len = 0;
-        }
-
-        str_buffer[str_len++] = *c;
-        str_buffer[str_len] = '\0';
-
-        if ((*(c+1) & 0xC0) == 0x80 && str_len < 4) {
-            continue;
-        }
-
-        int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
-
-        if (id != -1) {
-            tokens[(*n_tokens)++] = id;
-        } else {
-            for (int i = 0; i < str_len; i++) {
-                tokens[(*n_tokens)++] = (unsigned char)str_buffer[i] + 3;
-            }
-        }
-        str_len = 0;
-    }
-
-    while (1) {
-        float best_score = -1e10;
-        int best_id = -1;
-        int best_idx = -1;
-
-        for (int i = 0; i < (*n_tokens-1); i++) {
-            sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i+1]]);
-            int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
-            if (id != -1 && t->vocab_scores[id] > best_score) {
-                best_score = t->vocab_scores[id];
-                best_id = id;
-                best_idx = i;
+    while (*pos != '\0') {
+        int found_special = 0;
+        for (int i = 0; SPECIAL_TOKENS[i].token != NULL; i++) {
+            size_t len = strlen(SPECIAL_TOKENS[i].token);
+            if (strncmp(pos, SPECIAL_TOKENS[i].token, len) == 0) {
+                tokens[(*n_tokens)++] = SPECIAL_TOKENS[i].id;
+                pos += len;
+                found_special = 1;
+                break;
             }
         }
 
-        if (best_idx == -1) {
-            break;
-        }
+        if (!found_special) {
+            size_t seg_len = 0;
+            char* seg_start = pos;
 
-        tokens[best_idx] = best_id;
-        for (int i = best_idx+1; i < (*n_tokens-1); i++) {
-            tokens[i] = tokens[i+1];
+            while (*pos != '\0') {
+                int is_special_start = 0;
+                for (int i = 0; SPECIAL_TOKENS[i].token != NULL; i++) {
+                    if (strncmp(pos, SPECIAL_TOKENS[i].token, strlen(SPECIAL_TOKENS[i].token)) == 0) {
+                        is_special_start = 1;
+                        break;
+                    }
+                }
+                if (is_special_start) break;
+                pos++;
+                seg_len++;
+            }
+
+            if (seg_len > 0) {
+                strncpy(segment, seg_start, seg_len);
+                segment[seg_len] = '\0';
+                encode_segment(t, segment, tokens, n_tokens);
+            }
         }
-        (*n_tokens)--;
     }
 
     if (eos) tokens[(*n_tokens)++] = 2;
-
-    free(str_buffer);
+    free(segment);
 }
 
 typedef struct {
@@ -1163,52 +1203,79 @@ void generate(Qwen35 *model, Tokenizer *tokenizer, Sampler *sampler, char *promp
 
 void read_stdin(const char* guide, char* buffer, size_t bufsize) {
     printf("%s", guide);
+    fflush(stdout);
     if (fgets(buffer, bufsize, stdin) != NULL) {
         size_t len = strlen(buffer);
         if (len > 0 && buffer[len - 1] == '\n') {
             buffer[len - 1] = '\0';
         }
+    } else {
+        buffer[0] = '\0';
     }
 }
 
 void chat(Qwen35 *model, Tokenizer *tokenizer, Sampler *sampler,
           char *cli_user_prompt, char *cli_system_prompt, int steps) {
 
+    const int im_end_id = 248046;
     char system_prompt[512];
-    char user_prompt[512];
-    char rendered_prompt[2048];
+    char user_prompt[2048];
+    int rendered_size = 8192;
+    char* rendered_prompt = malloc(rendered_size * sizeof(char));
     int num_prompt_tokens = 0;
-    int* prompt_tokens = (int*)malloc(2048 * sizeof(int));
+    int* prompt_tokens = (int*)malloc(rendered_size * sizeof(int));
     int user_idx;
 
     int8_t user_turn = 1;
+    int8_t first_turn = 1;
     int next = 0;
     int token;
     int pos = 0;
+    long start = 0;
+    int generated_tokens = 0;
+
     while (pos < steps) {
 
         if (user_turn) {
-            if (pos == 0) {
+            if (first_turn) {
                 if (cli_system_prompt == NULL) {
                     read_stdin("Enter system prompt (optional): ", system_prompt, sizeof(system_prompt));
                 } else {
                     strcpy(system_prompt, cli_system_prompt);
                 }
             }
-            if (pos == 0 && cli_user_prompt != NULL) {
+
+            if (first_turn && cli_user_prompt != NULL) {
                 strcpy(user_prompt, cli_user_prompt);
             } else {
                 read_stdin("User: ", user_prompt, sizeof(user_prompt));
+                if (user_prompt[0] == '\0') { break; }
             }
 
-            if (pos == 0 && system_prompt[0] != '\0') {
-                sprintf(rendered_prompt, "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", system_prompt, user_prompt);
+            if (user_prompt[0] == '\0') { continue; }
+
+            if (first_turn) {
+                if (system_prompt[0] != '\0') {
+                    snprintf(rendered_prompt, rendered_size,
+                        "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
+                        system_prompt, user_prompt);
+                } else {
+                    snprintf(rendered_prompt, rendered_size,
+                        "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
+                        user_prompt);
+                }
             } else {
-                sprintf(rendered_prompt, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", user_prompt);
+                snprintf(rendered_prompt, rendered_size,
+                    "<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
+                    user_prompt);
             }
+
             encode(tokenizer, rendered_prompt, 0, 0, prompt_tokens, &num_prompt_tokens);
             user_idx = 0;
             user_turn = 0;
+            first_turn = 0;
+            generated_tokens = 0;
+            start = time_in_ms();
             printf("Assistant: ");
         }
 
@@ -1218,21 +1285,28 @@ void chat(Qwen35 *model, Tokenizer *tokenizer, Sampler *sampler,
             token = next;
         }
 
-        int im_end_id = 248046;
-        if (token == im_end_id || token == 2) { user_turn = 1; }
-
         float* logits = forward(model, token, pos);
         next = sample(sampler, logits);
         pos++;
 
-        if (user_idx >= num_prompt_tokens && next != im_end_id && next != 2) {
-            char* piece = decode(tokenizer, token, next);
-            safe_printf(piece);
-            fflush(stdout);
+        if (user_idx >= num_prompt_tokens) {
+            if (next == im_end_id || next == 2) {
+                printf("\n");
+                long end = time_in_ms();
+                if (generated_tokens > 0 && (end - start) > 0) {
+                    fprintf(stderr, "tok/s: %.2f\n", generated_tokens / (double)(end - start) * 1000);
+                }
+                user_turn = 1;
+            } else {
+                char* piece = decode(tokenizer, token, next);
+                safe_printf(piece);
+                fflush(stdout);
+                generated_tokens++;
+            }
         }
-        if (next == im_end_id || next == 2) { printf("\n"); user_turn = 1; }
     }
     printf("\n");
+    free(rendered_prompt);
     free(prompt_tokens);
 }
 
@@ -1240,16 +1314,16 @@ void chat(Qwen35 *model, Tokenizer *tokenizer, Sampler *sampler,
 
 void error_usage() {
     fprintf(stderr, "Usage:   qwen35 <checkpoint> [options]\n");
-    fprintf(stderr, "Example: qwen35 model.bin -n 256 -i \"Once upon a time\"\n");
+    fprintf(stderr, "Example: qwen35 model.bin -y \"You are a helpful assistant.\"\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
-    fprintf(stderr, "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n");
-    fprintf(stderr, "  -i <string> input prompt\n");
+    fprintf(stderr, "  -n <int>    number of steps to run for, default max_seq_len\n");
+    fprintf(stderr, "  -i <string> first user message (optional)\n");
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
-    fprintf(stderr, "  -m <string> mode: generate|chat, default: generate\n");
-    fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
+    fprintf(stderr, "  -m <string> mode: generate|chat, default: chat\n");
+    fprintf(stderr, "  -y <string> (optional) system prompt\n");
     exit(EXIT_FAILURE);
 }
 
@@ -1262,7 +1336,7 @@ int main(int argc, char *argv[]) {
     int steps = 256;
     char *prompt = NULL;
     unsigned long long rng_seed = 0;
-    char *mode = "generate";
+    char *mode = "chat";
     char *system_prompt = NULL;
 
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
