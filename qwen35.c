@@ -76,8 +76,6 @@ typedef struct {
     float *att;
     float *logits;
     float *gate;
-    float *q_norm_buf;
-    float *k_norm_buf;
     float *key_cache;
     float *value_cache;
     float *qkv;
@@ -120,8 +118,6 @@ void malloc_run_state(RunState* s, Config* p) {
     s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
     s->gate = calloc(p->n_heads * d_head, sizeof(float));
-    s->q_norm_buf = calloc(d_head, sizeof(float));
-    s->k_norm_buf = calloc(d_head, sizeof(float));
     s->key_cache = calloc(p->n_layer * p->seq_len * kv_dim, sizeof(float));
     s->value_cache = calloc(p->n_layer * p->seq_len * kv_dim, sizeof(float));
 
@@ -159,8 +155,6 @@ void free_run_state(RunState* s) {
     free(s->att);
     free(s->logits);
     free(s->gate);
-    free(s->q_norm_buf);
-    free(s->k_norm_buf);
     free(s->key_cache);
     free(s->value_cache);
     free(s->qkv);
@@ -485,18 +479,12 @@ void forward_attention_layer(Qwen35* model, int l, int la, int pos) {
             q_ptr[i] = s->q[h * head_size * 2 + i];
             gate_ptr[i] = s->q[h * head_size * 2 + head_size + i];
         }
-        gemma_rmsnorm(s->q_norm_buf, q_ptr, q_norm, head_size, eps);
-        for (int i = 0; i < head_size; i++) {
-            q_ptr[i] = s->q_norm_buf[i];
-        }
+        gemma_rmsnorm(q_ptr, q_ptr, q_norm, head_size, eps);
     }
 
     for (int h = 0; h < p->n_kv_heads; h++) {
         float* k_ptr = s->k + h * head_size;
-        gemma_rmsnorm(s->k_norm_buf, k_ptr, k_norm, head_size, eps);
-        for (int i = 0; i < head_size; i++) {
-            k_ptr[i] = s->k_norm_buf[i];
-        }
+        gemma_rmsnorm(k_ptr, k_ptr, k_norm, head_size, eps);
     }
 
     float theta = p->rope_theta;
