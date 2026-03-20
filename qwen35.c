@@ -626,6 +626,10 @@ void forward_linear_attention_layer(Qwen35* model, int l, int ld, int pos) {
     float* linear_norm    = w->linear_norm    + (long long)ld * d_v;
     float* out_proj       = w->out_proj       + (long long)ld * dim * value_dim;
 
+    // state for this layer
+    float* conv_state = s->conv_state + l * conv_dim * conv_kernel;
+    float* S = s->S + l * n_v_heads * d_k * d_v;
+
     // pre-attention norm
     gemma_rmsnorm(s->xb, x, rms_att_weight, dim, eps);
 
@@ -646,7 +650,6 @@ void forward_linear_attention_layer(Qwen35* model, int l, int ld, int pos) {
     }
 
     // shift conv state buffer and apply depthwise conv1d + SiLU to qkv
-    float* conv_state = s->conv_state + l * conv_dim * conv_kernel;
     for (int i = 0; i < conv_dim; i++) {
         for (int j = 0; j < conv_kernel - 1; j++) {
             conv_state[i * conv_kernel + j] = conv_state[i * conv_kernel + j + 1];
@@ -669,47 +672,27 @@ void forward_linear_attention_layer(Qwen35* model, int l, int ld, int pos) {
     float* k = qkv_conv + key_dim;
     float* v = qkv_conv + key_dim * 2;
 
+    // L2-normalize q and k per group-head, scale q
     float scale = 1.0f / sqrtf((float)d_k);
-
-    // expand q/k heads to match n_v_heads if using GQA (n_v_heads > n_k_heads)
-    float* q_work = q;
-    float* k_work = k;
-    if (n_v_heads > n_k_heads) {
-        int r = n_v_heads / n_k_heads;
-        float* q_expanded = s->delta_S;
-        float* k_expanded = s->linear_out;
-        for (int h = 0; h < n_k_heads; h++) {
-            for (int rep = 0; rep < r; rep++) {
-                int target_h = h * r + rep;
-                for (int i = 0; i < d_k; i++) {
-                    q_expanded[target_h * d_k + i] = q[h * d_k + i];
-                    k_expanded[target_h * d_k + i] = k[h * d_k + i];
-                }
-            }
-        }
-        q_work = q_expanded;
-        k_work = k_expanded;
-    }
-
-    // L2-normalize q and k per head, scale q
-    for (int h = 0; h < n_v_heads; h++) {
-        l2norm(q_work + h * d_k, d_k);
+    for (int h = 0; h < n_k_heads; h++) {
+        l2norm(k + h * d_k, d_k);
+        l2norm(q + h * d_k, d_k);
         for (int i = 0; i < d_k; i++) {
-            q_work[h * d_k + i] *= scale;
+            q[h * d_k + i] *= scale;
         }
-        l2norm(k_work + h * d_k, d_k);
     }
+
+    // GQA ratio: each k/q head is shared by r value heads; use h/r to index into q and k
+    int r = (n_v_heads > n_k_heads) ? n_v_heads / n_k_heads : 1;
 
     // linear attention state update per head: decay S, delta rule write, then read out
-    float* S = s->S + l * n_v_heads * d_k * d_v;
-
     for (int h = 0; h < n_v_heads; h++) {
         float g_t = expf(s->g[h]);
         float beta_t = s->beta[h];
 
         float* S_h = S + h * d_k * d_v;
-        float* q_h = q_work + h * d_k;
-        float* k_h = k_work + h * d_k;
+        float* q_h = q + (h / r) * d_k;
+        float* k_h = k + (h / r) * d_k;
         float* v_h = v + h * d_v;
 
         // decay state
