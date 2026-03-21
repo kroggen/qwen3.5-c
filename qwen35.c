@@ -118,8 +118,13 @@ void malloc_run_state(RunState* s, Config* p) {
     s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
     s->gate = calloc(p->n_heads * d_head, sizeof(float));
-    s->key_cache = calloc(p->n_layer * p->seq_len * kv_dim, sizeof(float));
-    s->value_cache = calloc(p->n_layer * p->seq_len * kv_dim, sizeof(float));
+
+    /* One KV block per full-attention layer (same indexing as wq/wk/wv/wo). */
+    size_t kv_layers = (size_t)p->n_full_attn_layers;
+    if (kv_layers == 0)
+        kv_layers = 1; /* avoid 0-byte calloc failing !ptr check; unused if no full attn */
+    s->key_cache   = calloc(kv_layers * p->seq_len * kv_dim, sizeof(float));
+    s->value_cache = calloc(kv_layers * p->seq_len * kv_dim, sizeof(float));
 
     if (p->n_linear_k_heads > 0) {
         int key_dim = p->n_linear_k_heads * p->d_linear_k;
@@ -130,9 +135,9 @@ void malloc_run_state(RunState* s, Config* p) {
         s->beta = calloc(p->n_linear_v_heads, sizeof(float));
         s->g = calloc(p->n_linear_v_heads, sizeof(float));
         s->linear_out = calloc(value_dim, sizeof(float));
-        s->S = calloc(p->n_layer * p->n_linear_v_heads * p->d_linear_k * p->d_linear_v, sizeof(float));
-        s->conv_state = calloc(p->n_layer * (key_dim * 2 + value_dim) * p->linear_conv_kernel, sizeof(float));
         s->delta_S = calloc(p->n_linear_v_heads * p->d_linear_k * p->d_linear_v, sizeof(float));
+        s->S = calloc(p->n_linear_attn_layers * p->n_linear_v_heads * p->d_linear_k * p->d_linear_v, sizeof(float));
+        s->conv_state = calloc(p->n_linear_attn_layers * (key_dim * 2 + value_dim) * p->linear_conv_kernel, sizeof(float));
     }
 
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
@@ -433,7 +438,7 @@ void forward_attention_layer(Qwen35* model, int l, int la, int pos) {
     int q_dim        = p->n_heads * head_size * 2;  // packs [q | gate] per head
     int attn_out_dim = p->n_heads * head_size;
     int kv_mul       = p->n_heads / p->n_kv_heads;
-    int loff         = l * p->seq_len * kv_dim;
+    int loff         = la * p->seq_len * kv_dim;
     float eps        = p->rms_norm_eps;
     float* key_cache_row   = s->key_cache   + loff + pos * kv_dim;
     float* value_cache_row = s->value_cache + loff + pos * kv_dim;
@@ -626,9 +631,9 @@ void forward_linear_attention_layer(Qwen35* model, int l, int ld, int pos) {
     float* linear_norm    = w->linear_norm    + (long long)ld * d_v;
     float* out_proj       = w->out_proj       + (long long)ld * dim * value_dim;
 
-    // state for this layer
-    float* conv_state = s->conv_state + l * conv_dim * conv_kernel;
-    float* S = s->S + l * n_v_heads * d_k * d_v;
+    // state for this linear-attention block (same index as weight tensors)
+    float* conv_state = s->conv_state + (long long)ld * conv_dim * conv_kernel;
+    float* S = s->S + (long long)ld * n_v_heads * d_k * d_v;
 
     // pre-attention norm
     gemma_rmsnorm(s->xb, x, rms_att_weight, dim, eps);
