@@ -681,10 +681,12 @@ void forward_linear_attention_layer(Qwen35* model, int l, int ld, int pos) {
     // L2-normalize q and k per group-head, scale q
     float scale = 1.0f / sqrtf((float)d_k);
     for (int h = 0; h < n_k_heads; h++) {
-        l2norm(k + h * d_k, d_k);
-        l2norm(q + h * d_k, d_k);
+        float* k_h = k + h * d_k;
+        float* q_h = q + h * d_k;
+        l2norm(k_h, d_k);
+        l2norm(q_h, d_k);
         for (int i = 0; i < d_k; i++) {
-            q[h * d_k + i] *= scale;
+            q_h[i] *= scale;
         }
     }
 
