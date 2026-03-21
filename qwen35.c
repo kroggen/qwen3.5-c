@@ -105,39 +105,40 @@ void malloc_run_state(RunState* s, Config* p) {
     int kv_dim = p->n_kv_heads * p->d_head;
     int hidden_dim = p->n_mlp;
     int d_head = p->d_head > 0 ? p->d_head : dim / p->n_heads;
-
     int attn_dim = p->n_heads * d_head;  // attention output dimension
-    s->x = calloc(dim, sizeof(float));
-    s->xb = calloc(attn_dim > dim ? attn_dim : dim, sizeof(float));
-    s->xb2 = calloc(dim, sizeof(float));
-    s->hb = calloc(hidden_dim, sizeof(float));
-    s->hb2 = calloc(hidden_dim, sizeof(float));
-    s->q = calloc(p->n_heads * d_head * 2, sizeof(float));
-    s->k = calloc(kv_dim, sizeof(float));
-    s->v = calloc(kv_dim, sizeof(float));
-    s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
-    s->logits = calloc(p->vocab_size, sizeof(float));
-    s->gate = calloc(p->n_heads * d_head, sizeof(float));
+    size_t n_kv_layers     = (size_t) p->n_full_attn_layers;
+    size_t n_linear_layers = (size_t) p->n_linear_attn_layers;
 
-    /* One KV block per full-attention layer (same indexing as wq/wk/wv/wo). */
-    size_t kv_layers = (size_t)p->n_full_attn_layers;
-    if (kv_layers == 0)
-        kv_layers = 1; /* avoid 0-byte calloc failing !ptr check; unused if no full attn */
-    s->key_cache   = calloc(kv_layers * p->seq_len * kv_dim, sizeof(float));
-    s->value_cache = calloc(kv_layers * p->seq_len * kv_dim, sizeof(float));
+    s->x      = calloc(dim,                             sizeof(float));
+    s->xb     = calloc(attn_dim > dim ? attn_dim : dim, sizeof(float));
+    s->xb2    = calloc(dim,                             sizeof(float));
+    s->hb     = calloc(hidden_dim,                      sizeof(float));
+    s->hb2    = calloc(hidden_dim,                      sizeof(float));
+    s->q      = calloc(p->n_heads * d_head * 2,         sizeof(float));
+    s->k      = calloc(kv_dim,                          sizeof(float));
+    s->v      = calloc(kv_dim,                          sizeof(float));
+    s->att    = calloc(p->n_heads * p->seq_len,         sizeof(float));
+    s->logits = calloc(p->vocab_size,                   sizeof(float));
+    s->gate   = calloc(p->n_heads * d_head,             sizeof(float));
 
-    if (p->n_linear_k_heads > 0) {
-        int key_dim = p->n_linear_k_heads * p->d_linear_k;
+    /* One KV cache block per full-attention layer (same indexing as wq/wk/wv/wo). */
+    if (n_kv_layers > 0) {
+        s->key_cache   = calloc(n_kv_layers * p->seq_len * kv_dim, sizeof(float));
+        s->value_cache = calloc(n_kv_layers * p->seq_len * kv_dim, sizeof(float));
+    }
+
+    if (n_linear_layers > 0) {
+        int key_dim   = p->n_linear_k_heads * p->d_linear_k;
         int value_dim = p->n_linear_v_heads * p->d_linear_v;
 
-        s->qkv = calloc(key_dim * 2 + value_dim, sizeof(float));
-        s->z = calloc(value_dim, sizeof(float));
-        s->beta = calloc(p->n_linear_v_heads, sizeof(float));
-        s->g = calloc(p->n_linear_v_heads, sizeof(float));
+        s->qkv        = calloc(key_dim * 2 + value_dim, sizeof(float));
+        s->z          = calloc(value_dim, sizeof(float));
+        s->beta       = calloc(p->n_linear_v_heads, sizeof(float));
+        s->g          = calloc(p->n_linear_v_heads, sizeof(float));
         s->linear_out = calloc(value_dim, sizeof(float));
-        s->delta_S = calloc(p->n_linear_v_heads * p->d_linear_k * p->d_linear_v, sizeof(float));
-        s->S = calloc(p->n_linear_attn_layers * p->n_linear_v_heads * p->d_linear_k * p->d_linear_v, sizeof(float));
-        s->conv_state = calloc(p->n_linear_attn_layers * (key_dim * 2 + value_dim) * p->linear_conv_kernel, sizeof(float));
+        s->delta_S    = calloc(p->n_linear_v_heads * p->d_linear_k * p->d_linear_v, sizeof(float));
+        s->S          = calloc(n_linear_layers * p->n_linear_v_heads * p->d_linear_k * p->d_linear_v, sizeof(float));
+        s->conv_state = calloc(n_linear_layers * (key_dim * 2 + value_dim) * p->linear_conv_kernel, sizeof(float));
     }
 
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
@@ -269,23 +270,23 @@ void read_checkpoint(char* checkpoint, Config* config, Weights* weights,
         exit(EXIT_FAILURE);
     }
 
-    if (fread(&config->dim, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->n_heads, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->n_kv_heads, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->n_layer, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->n_mlp, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->vocab_size, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->seq_len, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->rope_theta, sizeof(float), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->rms_norm_eps, sizeof(float), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->tie_word_embeddings, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->d_head, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->n_linear_k_heads, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->n_linear_v_heads, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->d_linear_k, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->d_linear_v, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->linear_conv_kernel, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->n_full_attn_layers, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->dim,                  sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->n_heads,              sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->n_kv_heads,           sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->n_layer,              sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->n_mlp,                sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->vocab_size,           sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->seq_len,              sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->rope_theta,           sizeof(float), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->rms_norm_eps,         sizeof(float), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->tie_word_embeddings,  sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->d_head,               sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->n_linear_k_heads,     sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->n_linear_v_heads,     sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->d_linear_k,           sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->d_linear_v,           sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->linear_conv_kernel,   sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(&config->n_full_attn_layers,   sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
     if (fread(&config->n_linear_attn_layers, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
 
     *layer_types = calloc(config->n_layer, sizeof(int));
