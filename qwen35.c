@@ -422,7 +422,7 @@ int load_weights_from_safetensors(Qwen35 *model, const char *model_dir) {
         return -1;
     }
 
-    fprintf(stderr, "Loaded %zu tensors\n", model->safetensors.n_tensors);
+    fprintf(stderr, "File has %zu tensors\n", model->safetensors.n_tensors);
 
     int head_size     = p->d_head > 0 ? p->d_head : p->dim / p->n_heads;
     int kv_dim        = p->n_kv_heads * head_size;
