@@ -12,6 +12,8 @@ import json
 import numpy as np
 import torch
 
+from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
+
 QWEN35_MAGIC = 0x51773335
 VERSION = 1
 
@@ -29,14 +31,14 @@ def serialize_float32(file, val):
     file.write(struct.pack("f", val))
 
 
-def load_model(path):
+def load_model(path, cache_dir=None):
     print(f"loading model from {path}")
 
     if "/" in path and not os.path.exists(path):
         print(f"Downloading from HuggingFace: {path}")
         from huggingface_hub import snapshot_download
 
-        path = snapshot_download(repo_id=path, cache_dir=".cache")
+        path = snapshot_download(repo_id=path, cache_dir=cache_dir)
         print(f"Downloaded to: {path}")
 
     if os.path.isdir(path):
@@ -513,9 +515,18 @@ def main():
     parser.add_argument(
         "--max-seq-len", type=int, default=2048, help="Maximum sequence length"
     )
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default=None,
+        help=(
+            "HuggingFace cache directory "
+            f"(default: {HUGGINGFACE_HUB_CACHE})"
+        ),
+    )
     args = parser.parse_args()
 
-    model_weights, config = load_model(args.source)
+    model_weights, config = load_model(args.source, cache_dir=args.cache_dir)
     export_qwen35(model_weights, config, args.destination, args.max_seq_len)
 
 
