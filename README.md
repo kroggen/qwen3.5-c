@@ -2,7 +2,7 @@
 
 Inference of Qwen3.5 models in pure C, for learning purpose
 
-No pytorch required. The safetensors loading is handled by [safetensors-cpp](https://github.com/syoyo/safetensors-cpp)
+No pytorch required. The safetensors loading is done with [safetensors-cpp](https://github.com/syoyo/safetensors-cpp)
 
 Inspired by [llama2.c](https://github.com/karpathy/llama2.c) and [mamba.c](https://github.com/kroggen/mamba.c)
 
@@ -22,14 +22,14 @@ make fast
 ./qwen35 Qwen3.5-0.8B
 ```
 
-Or use a local model directory:
-```bash
-./qwen35 ./Qwen3.5-0.8B
-```
-
 If there are more than 1 model with the same name on the local cache, pass the full name of the model:
 ```
 ./qwen35 Qwen/Qwen3.5-0.8B
+```
+
+Or pass the path to the folder containing the model:
+```bash
+./qwen35 ./Qwen3.5-0.8B
 ```
 
 
