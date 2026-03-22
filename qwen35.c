@@ -1720,9 +1720,68 @@ void chat(Qwen35 *model, Tokenizer *tokenizer, Sampler *sampler,
 
 #ifndef TESTING
 
+static char* resolve_model_path(const char *model_name) {
+    static char resolved_path[4096];
+
+    if (model_name[0] == '/' || model_name[0] == '.') {
+        return (char*)model_name;
+    }
+
+    FILE *f = fopen("models.json", "rb");
+    if (!f) {
+        return (char*)model_name;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    char *json_str = (char *)malloc(size + 1);
+    if (!json_str) {
+        fclose(f);
+        return (char*)model_name;
+    }
+
+    if (fread(json_str, 1, size, f) != (size_t)size) {
+        free(json_str);
+        fclose(f);
+        return (char*)model_name;
+    }
+    json_str[size] = '\0';
+    fclose(f);
+
+    char error[256] = {0};
+    JsonValue *root = json_parse(json_str, size, error, sizeof(error));
+    free(json_str);
+
+    if (!root) {
+        return (char*)model_name;
+    }
+
+    JsonValue *model_entry = json_object_get(root, model_name);
+    if (!model_entry || model_entry->type != JSON_OBJECT) {
+        json_free(root);
+        return (char*)model_name;
+    }
+
+    JsonValue *path_val = json_object_get(model_entry, "path");
+    if (!path_val || path_val->type != JSON_STRING) {
+        json_free(root);
+        return (char*)model_name;
+    }
+
+    strncpy(resolved_path, path_val->data.string, sizeof(resolved_path) - 1);
+    resolved_path[sizeof(resolved_path) - 1] = '\0';
+
+    json_free(root);
+    return resolved_path;
+}
+
 void error_usage() {
-    fprintf(stderr, "Usage:   qwen35 <model_dir> [options]\n");
-    fprintf(stderr, "Example: qwen35 ./Qwen3.5-0.8B -y \"You are a helpful assistant.\"\n");
+    fprintf(stderr, "Usage:   qwen35 <model> [options]\n");
+    fprintf(stderr, "         qwen35 <model_dir> [options]\n");
+    fprintf(stderr, "Example: qwen35 Qwen/Qwen3.5-0.8B -y \"You are a helpful assistant.\"\n");
+    fprintf(stderr, "         qwen35 ./Qwen3.5-0.8B -y \"You are a helpful assistant.\"\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -t <float>  temperature in [0,inf], default 0 (greedy argmax)\n");
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
@@ -1737,7 +1796,7 @@ void error_usage() {
 
 int main(int argc, char *argv[]) {
 
-    char *model_path = NULL;
+    char *model_arg = NULL;
     char *tokenizer_path = "tokenizer.bin";
     float temperature = 0.0f;
     float topp = 0.9f;
@@ -1747,7 +1806,9 @@ int main(int argc, char *argv[]) {
     char *mode = "chat";
     char *system_prompt = NULL;
 
-    if (argc >= 2) { model_path = argv[1]; } else { error_usage(); }
+    if (argc >= 2) { model_arg = argv[1]; } else { error_usage(); }
+
+    char *model_path = resolve_model_path(model_arg);
     for (int i = 2; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); }
         if (argv[i][0] != '-') { error_usage(); }
