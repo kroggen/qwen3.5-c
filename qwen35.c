@@ -398,9 +398,9 @@ void softmax(float* x, int size) {
 }
 
 void matmul(float* xout, float* x, float* w, int n, int d) {
-    int i;
-    #pragma omp parallel for private(i)
-    for (i = 0; i < d; i++) {
+    /* OpenMP only for large output rows; small d is faster serial + SIMD. */
+    #pragma omp parallel for if (d > 256)
+    for (int i = 0; i < d; i++) {
         float val = 0.0f;
         for (int j = 0; j < n; j++) {
             val += w[i * n + j] * x[j];
@@ -505,7 +505,7 @@ void forward_attention_layer(Qwen35* model, int l, int la, int pos) {
 
     // RoPE rotary positional embeddings on q and k
     float theta = p->rope_theta;
-    for (int i = 0; i < head_size; i+=2) {
+    for (int i = 0; i < head_size; i += 2) {
         float freq = 1.0f / powf(theta, (float)i / head_size);
         float val = pos * freq;
         float fcr = cosf(val);
@@ -514,16 +514,16 @@ void forward_attention_layer(Qwen35* model, int l, int la, int pos) {
         for (int h = 0; h < p->n_heads; h++) {
             float* q = s->q + h * head_size;
             float q0 = q[i];
-            float q1 = q[i+1];
-            q[i]   = q0 * fcr - q1 * fci;
-            q[i+1] = q0 * fci + q1 * fcr;
+            float q1 = q[i + 1];
+            q[i]     = q0 * fcr - q1 * fci;
+            q[i + 1] = q0 * fci + q1 * fcr;
         }
         for (int h = 0; h < p->n_kv_heads; h++) {
             float* k = s->k + h * head_size;
             float k0 = k[i];
-            float k1 = k[i+1];
-            k[i]   = k0 * fcr - k1 * fci;
-            k[i+1] = k0 * fci + k1 * fcr;
+            float k1 = k[i + 1];
+            k[i]     = k0 * fcr - k1 * fci;
+            k[i + 1] = k0 * fci + k1 * fcr;
         }
     }
 
@@ -541,9 +541,8 @@ void forward_attention_layer(Qwen35* model, int l, int la, int pos) {
     memcpy(value_cache_row, s->v, kv_dim * sizeof(float));
 
     // multi-head attention
-    int h;
-    #pragma omp parallel for private(h)
-    for (h = 0; h < p->n_heads; h++) {
+    #pragma omp parallel for
+    for (int h = 0; h < p->n_heads; h++) {
         float* q = s->q + h * head_size;
         float* att = s->att + h * p->seq_len;
 
@@ -644,18 +643,20 @@ void forward_linear_attention_layer(Qwen35* model, int l, int ld, int pos) {
     matmul(s->z, s->xb, in_proj_z, dim, value_dim);
 
     // beta (write strength) per head
+    #pragma omp parallel for
     for (int i = 0; i < n_v_heads; i++) {
         s->beta[i] = sigmoid(matmul_scalar(s->xb, in_proj_b + i * dim, dim));
     }
 
     // g (decay rate) per head: g = A * softplus(a + dt_bias), A < 0
+    #pragma omp parallel for
     for (int i = 0; i < n_v_heads; i++) {
         float a_val = matmul_scalar(s->xb, in_proj_a + i * dim, dim);
         float A = -expf(A_log[i]);
         s->g[i] = A * softplus(a_val + dt_bias[i]);
     }
 
-    // shift conv state buffer and apply depthwise conv1d + SiLU to qkv
+    // shift conv state buffer
     for (int i = 0; i < conv_dim; i++) {
         for (int j = 0; j < conv_kernel - 1; j++) {
             conv_state[i * conv_kernel + j] = conv_state[i * conv_kernel + j + 1];
@@ -663,7 +664,7 @@ void forward_linear_attention_layer(Qwen35* model, int l, int ld, int pos) {
         conv_state[i * conv_kernel + conv_kernel - 1] = s->qkv[i];
     }
 
-    // apply conv weights and SiLU
+    // apply depthwise conv1d weights and SiLU to qkv
     float* qkv_conv = s->qkv;
     for (int i = 0; i < conv_dim; i++) {
         float val = 0.0f;
@@ -694,6 +695,7 @@ void forward_linear_attention_layer(Qwen35* model, int l, int ld, int pos) {
     int r = (n_v_heads > n_k_heads) ? n_v_heads / n_k_heads : 1;
 
     // linear attention state update per head: decay S, delta rule write, then read out
+    #pragma omp parallel for
     for (int h = 0; h < n_v_heads; h++) {
         float g_t = expf(s->g[h]);
         float beta_t = s->beta[h];
@@ -1146,6 +1148,7 @@ int sample(Sampler* sampler, float* logits) {
     if (sampler->temperature == 0.0f) {
         next = sample_argmax(logits, sampler->vocab_size);
     } else {
+        #pragma omp parallel for if (sampler->vocab_size > 4096)
         for (int q = 0; q < sampler->vocab_size; q++) { logits[q] /= sampler->temperature; }
         softmax(logits, sampler->vocab_size);
         float coin = random_f32(&sampler->rng_state);
