@@ -1834,7 +1834,7 @@ int main(int argc, char *argv[]) {
     if (steps == 0 || steps > model.config.seq_len) steps = model.config.seq_len;
 
     Tokenizer tokenizer;
-    char tokenizer_full_path[4096];
+    char tokenizer_full_path[8192];
     if (tokenizer_path[0] != '/') {
         snprintf(tokenizer_full_path, sizeof(tokenizer_full_path), "%s/%s", model_path, tokenizer_path);
         FILE *f = fopen(tokenizer_full_path, "rb");
