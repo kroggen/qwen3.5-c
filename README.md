@@ -19,12 +19,17 @@ For fast inference, use other methods like [qwen3.5-triton](https://github.com/R
 pip install huggingface_hub transformers
 python prepare.py Qwen/Qwen3.5-0.8B   # download + create tokenizer
 make fast
-./qwen35 Qwen/Qwen3.5-0.8B
+./qwen35 Qwen3.5-0.8B
 ```
 
 Or use a local model directory:
 ```bash
 ./qwen35 ./Qwen3.5-0.8B
+```
+
+If there are more than 1 model with the same name on the local cache, pass the full name of the model:
+```
+./qwen35 Qwen/Qwen3.5-0.8B
 ```
 
 
@@ -61,7 +66,7 @@ make clean
 ./qwen35 <model> [options]
 
 # <model> can be a model name (after prepare.py) or a local directory
-./qwen35 Qwen/Qwen3.5-0.8B -i "Hello!"
+./qwen35 Qwen3.5-0.8B -i "Hello!"
 ./qwen35 ./Qwen3.5-0.8B -y "You are a helpful assistant."
 ```
 

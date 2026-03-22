@@ -440,7 +440,7 @@ int load_weights_from_safetensors(Qwen35 *model, const char *model_dir) {
         w->token_embedding_table = load_tensor_alloc(&model->safetensors, "model.language_model.embed_tokens.weight", 0);
     }
 
-    fprintf(stderr, "Loading attention layers...\n");
+    fprintf(stderr, "Loading full attention layers...\n");
     w->rms_att_weight = (float *)malloc((size_t)p->n_layer * p->dim * sizeof(float));
     w->wq = (float *)malloc((size_t)n_full_attn * p->dim * q_dim * sizeof(float));
     w->wk = (float *)malloc((size_t)n_full_attn * p->dim * kv_dim * sizeof(float));
@@ -1721,6 +1721,11 @@ static char* resolve_model_path(const char *model_name) {
 
     if (model_name[0] == '/' || model_name[0] == '.') {
         return (char*)model_name;
+    }
+
+    if (strchr(model_name, '/') == NULL) {
+        snprintf(resolved_path, sizeof(resolved_path), "Qwen/%s", model_name);
+        model_name = resolved_path;
     }
 
     FILE *f = fopen("models.json", "rb");
