@@ -1324,7 +1324,7 @@ void error_usage() {
     fprintf(stderr, "Usage:   qwen35 <checkpoint> [options]\n");
     fprintf(stderr, "Example: qwen35 model.bin -y \"You are a helpful assistant.\"\n");
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
+    fprintf(stderr, "  -t <float>  temperature in [0,inf], default 0 (greedy argmax)\n");
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
     fprintf(stderr, "  -n <int>    number of steps to run for, default max_seq_len\n");
@@ -1339,7 +1339,7 @@ int main(int argc, char *argv[]) {
 
     char *checkpoint_path = NULL;
     char *tokenizer_path = "tokenizer.bin";
-    float temperature = 1.0f;
+    float temperature = 0.0f;
     float topp = 0.9f;
     int steps = 256;
     char *prompt = NULL;
