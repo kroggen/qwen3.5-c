@@ -1,4 +1,5 @@
 /* Inference for Qwen-3.5 model in pure C */
+/* Loads weights directly from safetensors format */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,9 +13,11 @@
 #else
     #include <unistd.h>
     #include <sys/mman.h>
+    #include <dirent.h>
 #endif
 
-#define QWEN35_MAGIC 0x51773335
+#include "csafetensors.h"
+#include "json.h"
 
 typedef struct {
     int dim;
@@ -92,12 +95,11 @@ typedef struct {
     Config config;
     Weights weights;
     RunState state;
-    int fd;
-    float* data;
-    ssize_t file_size;
     int* layer_types;
     int* attn_layer_indices;
     int* deltanet_layer_indices;
+    csafetensors_t safetensors;
+    int use_safetensors;
 } Qwen35;
 
 void malloc_run_state(RunState* s, Config* p) {
@@ -173,158 +175,553 @@ void free_run_state(RunState* s) {
     free(s->delta_S);
 }
 
-void memory_map_weights(Weights *w, Config* p, float* ptr, int n_full_attn, int n_linear_attn) {
-    int head_size = p->d_head > 0 ? p->d_head : p->dim / p->n_heads;
-    int kv_dim = p->n_kv_heads * head_size;
-    int key_dim = p->n_linear_k_heads * p->d_linear_k;
-    int value_dim = p->n_linear_v_heads * p->d_linear_v;
-    int conv_dim = key_dim * 2 + value_dim;
+static int load_tensor_auto(const csafetensors_t *st, const char *name, float *dest, size_t expected_size) {
+    const csafetensors_tensor_t *tensor = csafetensors_get_tensor(st, name);
+    if (!tensor) return -1;
 
-    w->data = ptr;
-    w->token_embedding_table = ptr;
-    ptr += p->vocab_size * p->dim;
+    const uint8_t *data = csafetensors_get_tensor_data(st, tensor);
+    if (!data) return -1;
 
-    w->rms_att_weight = ptr;
-    ptr += p->n_layer * p->dim;
+    size_t num_elements = csafetensors_shape_size(tensor);
 
-    w->wq = ptr;
-    ptr += (long long)n_full_attn * p->dim * (p->n_heads * head_size * 2);
+    if (expected_size > 0 && num_elements != expected_size) {
+        fprintf(stderr, "Tensor %s size mismatch: got %zu, expected %zu\n", name, num_elements, expected_size);
+    }
 
-    w->wk = ptr;
-    ptr += (long long)n_full_attn * p->dim * kv_dim;
+    if (tensor->dtype == CSAFETENSORS_DTYPE_BFLOAT16) {
+        const uint16_t *bf16_data = (const uint16_t *)data;
+        for (size_t i = 0; i < num_elements; i++) {
+            dest[i] = csafetensors_bf16_to_f32(bf16_data[i]);
+        }
+    } else if (tensor->dtype == CSAFETENSORS_DTYPE_FLOAT16) {
+        const uint16_t *f16_data = (const uint16_t *)data;
+        for (size_t i = 0; i < num_elements; i++) {
+            dest[i] = csafetensors_f16_to_f32(f16_data[i]);
+        }
+    } else if (tensor->dtype == CSAFETENSORS_DTYPE_FLOAT32) {
+        memcpy(dest, data, num_elements * sizeof(float));
+    } else {
+        fprintf(stderr, "Unsupported dtype for tensor %s\n", name);
+        return -1;
+    }
 
-    w->wv = ptr;
-    ptr += (long long)n_full_attn * p->dim * kv_dim;
-
-    w->wo = ptr;
-    ptr += (long long)n_full_attn * (p->n_heads * head_size) * p->dim;
-
-    w->q_norm = ptr;
-    ptr += (long long)n_full_attn * head_size;
-
-    w->k_norm = ptr;
-    ptr += (long long)n_full_attn * head_size;
-
-    w->in_proj_qkv = ptr;
-    ptr += (long long)n_linear_attn * conv_dim * p->dim;
-
-    w->in_proj_z = ptr;
-    ptr += (long long)n_linear_attn * value_dim * p->dim;
-
-    w->in_proj_b = ptr;
-    ptr += (long long)n_linear_attn * p->n_linear_v_heads * p->dim;
-
-    w->in_proj_a = ptr;
-    ptr += (long long)n_linear_attn * p->n_linear_v_heads * p->dim;
-
-    w->conv1d_weight = ptr;
-    ptr += (long long)n_linear_attn * conv_dim * p->linear_conv_kernel;
-
-    w->dt_bias = ptr;
-    ptr += (long long)n_linear_attn * p->n_linear_v_heads;
-
-    w->A_log = ptr;
-    ptr += (long long)n_linear_attn * p->n_linear_v_heads;
-
-    w->linear_norm = ptr;
-    ptr += (long long)n_linear_attn * p->d_linear_v;
-
-    w->out_proj = ptr;
-    ptr += (long long)n_linear_attn * p->dim * value_dim;
-
-    w->rms_ffn_weight = ptr;
-    ptr += p->n_layer * p->dim;
-
-    w->w1 = ptr;
-    ptr += (long long)p->n_layer * p->dim * p->n_mlp;
-
-    w->w2 = ptr;
-    ptr += (long long)p->n_layer * p->n_mlp * p->dim;
-
-    w->w3 = ptr;
-    ptr += (long long)p->n_layer * p->dim * p->n_mlp;
-
-    w->rms_final_weight = ptr;
-    ptr += p->dim;
-
-    w->wcls = p->tie_word_embeddings ? w->token_embedding_table : ptr;
+    return 0;
 }
 
-void read_checkpoint(char* checkpoint, Config* config, Weights* weights,
-                     int* fd, float** data, ssize_t* file_size, int** layer_types,
-                     int** attn_layer_indices, int** deltanet_layer_indices) {
-    FILE *file = fopen(checkpoint, "rb");
-    if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); exit(EXIT_FAILURE); }
+static int get_layer_type(int layer_idx, const JsonValue *layer_types) {
+    if (!layer_types || layer_types->type != JSON_ARRAY) return 0;
+    if (layer_idx >= (int)layer_types->data.array.count) return 0;
+    JsonValue *lt = json_array_get(layer_types, layer_idx);
+    if (!lt || lt->type != JSON_STRING) return 0;
+    const char *type_str = lt->data.string;
+    if (strcmp(type_str, "linear_attention") == 0) return 1;
+    return 0;
+}
 
-    unsigned int magic;
-    if (fread(&magic, sizeof(unsigned int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (magic != QWEN35_MAGIC) {
-        fprintf(stderr, "Invalid magic number: 0x%x (expected 0x%x)\n", magic, QWEN35_MAGIC);
-        exit(EXIT_FAILURE);
+static char* find_file_in_dir(const char *dir, const char *name) {
+    static char path[4096];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        fclose(f);
+        return path;
+    }
+    return NULL;
+}
+
+static int ends_with_safetensors(const char *name) {
+    size_t len = strlen(name);
+    return len > 12 && strcmp(name + len - 12, ".safetensors") == 0;
+}
+
+static int starts_with_model(const char *name) {
+    return strncmp(name, "model", 5) == 0;
+}
+
+static int compare_strings(const void *a, const void *b) {
+    return strcmp(*(const char**)a, *(const char**)b);
+}
+
+static char** find_safetensors_files(const char *model_dir, int *count) {
+    DIR *dir = opendir(model_dir);
+    if (!dir) return NULL;
+
+    char **files = NULL;
+    *count = 0;
+    int capacity = 0;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type != DT_REG && entry->d_type != DT_LNK) continue;
+        if (!starts_with_model(entry->d_name)) continue;
+        if (!ends_with_safetensors(entry->d_name)) continue;
+
+        if (*count >= capacity) {
+            capacity = capacity ? capacity * 2 : 16;
+            files = realloc(files, capacity * sizeof(char*));
+        }
+        files[*count] = strdup(entry->d_name);
+        (*count)++;
+    }
+    closedir(dir);
+
+    if (*count == 0) {
+        free(files);
+        return NULL;
     }
 
-    int version;
-    if (fread(&version, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (version != 1) {
-        fprintf(stderr, "Unsupported version: %d (expected 1)\n", version);
-        exit(EXIT_FAILURE);
+    qsort(files, *count, sizeof(char*), compare_strings);
+    return files;
+}
+
+static char* get_safetensors_path(const char *model_dir) {
+    static char path[4096];
+
+    int count;
+    char **files = find_safetensors_files(model_dir, &count);
+    if (!files) return NULL;
+
+    snprintf(path, sizeof(path), "%s/%s", model_dir, files[0]);
+
+    for (int i = 0; i < count; i++) free(files[i]);
+    free(files);
+
+    return path;
+}
+
+int load_config(const char *model_dir, Config *config) {
+    char config_path[4096];
+    snprintf(config_path, sizeof(config_path), "%s/config.json", model_dir);
+
+    FILE *f = fopen(config_path, "rb");
+    if (!f) {
+        fprintf(stderr, "Could not open config.json at %s\n", config_path);
+        return -1;
     }
 
-    if (fread(&config->dim,                  sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->n_heads,              sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->n_kv_heads,           sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->n_layer,              sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->n_mlp,                sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->vocab_size,           sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->seq_len,              sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->rope_theta,           sizeof(float), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->rms_norm_eps,         sizeof(float), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->tie_word_embeddings,  sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->d_head,               sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->n_linear_k_heads,     sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->n_linear_v_heads,     sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->d_linear_k,           sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->d_linear_v,           sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->linear_conv_kernel,   sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->n_full_attn_layers,   sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (fread(&config->n_linear_attn_layers, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
 
-    *layer_types = calloc(config->n_layer, sizeof(int));
+    char *json_str = (char *)malloc(size + 1);
+    if (!json_str) {
+        fclose(f);
+        return -1;
+    }
+
+    if (fread(json_str, 1, size, f) != (size_t)size) {
+        free(json_str);
+        fclose(f);
+        return -1;
+    }
+    json_str[size] = '\0';
+    fclose(f);
+
+    char error[256] = {0};
+    JsonValue *root = json_parse(json_str, size, error, sizeof(error));
+    free(json_str);
+
+    if (!root) {
+        fprintf(stderr, "Failed to parse config.json: %s\n", error);
+        return -1;
+    }
+
+    JsonValue *cfg = json_object_get(root, "text_config");
+    if (!cfg) cfg = root;
+
+    memset(config, 0, sizeof(Config));
+
+    config->dim        = json_get_int(json_object_get(cfg, "hidden_size"), 896);
+    config->n_heads    = json_get_int(json_object_get(cfg, "num_attention_heads"), 14);
+    config->n_kv_heads = json_get_int(json_object_get(cfg, "num_key_value_heads"), config->n_heads);
+    config->n_layer    = json_get_int(json_object_get(cfg, "num_hidden_layers"), 24);
+    config->n_mlp      = json_get_int(json_object_get(cfg, "intermediate_size"), 4864);
+    if (config->n_mlp == 0) {
+        config->n_mlp = json_get_int(json_object_get(cfg, "shared_expert_intermediate_size"), 4864);
+    }
+    config->vocab_size   = json_get_int   (json_object_get(cfg, "vocab_size"), 151936);
+    config->rope_theta   = json_get_double(json_object_get(cfg, "rope_theta"), 10000.0);
+    config->rms_norm_eps = json_get_double(json_object_get(cfg, "rms_norm_eps"), 1e-6);
+    config->d_head       = json_get_int   (json_object_get(cfg, "head_dim"), config->dim / config->n_heads);
+    config->tie_word_embeddings = json_get_bool(json_object_get(root, "tie_word_embeddings"), 0);
+
+    config->n_linear_k_heads   = json_get_int(json_object_get(cfg, "linear_num_key_heads"), 0);
+    config->n_linear_v_heads   = json_get_int(json_object_get(cfg, "linear_num_value_heads"), 0);
+    config->d_linear_k         = json_get_int(json_object_get(cfg, "linear_key_head_dim"), 0);
+    config->d_linear_v         = json_get_int(json_object_get(cfg, "linear_value_head_dim"), 0);
+    config->linear_conv_kernel = json_get_int(json_object_get(cfg, "linear_conv_kernel_dim"), 4);
+
+    JsonValue *layer_types = json_object_get(cfg, "layer_types");
+
+    config->n_full_attn_layers = 0;
+    config->n_linear_attn_layers = 0;
+
     for (int i = 0; i < config->n_layer; i++) {
-        if (fread(&(*layer_types)[i], sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    }
-
-    *attn_layer_indices = calloc(config->n_layer, sizeof(int));
-    *deltanet_layer_indices = calloc(config->n_layer, sizeof(int));
-    int la = 0, ld = 0;
-    for (int i = 0; i < config->n_layer; i++) {
-        if ((*layer_types)[i] == 1) {
-            (*deltanet_layer_indices)[i] = ld++;
+        if (get_layer_type(i, layer_types) == 1) {
+            config->n_linear_attn_layers++;
         } else {
-            (*attn_layer_indices)[i] = la++;
+            config->n_full_attn_layers++;
         }
     }
 
-    fseek(file, 0, SEEK_END);
-    *file_size = ftell(file);
-    fclose(file);
+    config->seq_len = 2048;
 
-    *fd = open(checkpoint, O_RDONLY);
-    if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
-    *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
-    if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
-    float* weights_ptr = *data + 256 / sizeof(float);
-    memory_map_weights(weights, config, weights_ptr, config->n_full_attn_layers, config->n_linear_attn_layers);
+    json_free(root);
+
+    fprintf(stderr, "Model config:\n");
+    fprintf(stderr, "  dim: %d\n", config->dim);
+    fprintf(stderr, "  n_heads: %d\n", config->n_heads);
+    fprintf(stderr, "  n_kv_heads: %d\n", config->n_kv_heads);
+    fprintf(stderr, "  n_layer: %d\n", config->n_layer);
+    fprintf(stderr, "  n_mlp: %d\n", config->n_mlp);
+    fprintf(stderr, "  vocab_size: %d\n", config->vocab_size);
+    fprintf(stderr, "  d_head: %d\n", config->d_head);
+    fprintf(stderr, "  rope_theta: %f\n", config->rope_theta);
+    fprintf(stderr, "  rms_norm_eps: %f\n", config->rms_norm_eps);
+    fprintf(stderr, "  tie_word_embeddings: %d\n", config->tie_word_embeddings);
+    fprintf(stderr, "  n_full_attn_layers: %d\n", config->n_full_attn_layers);
+    fprintf(stderr, "  n_linear_attn_layers: %d\n", config->n_linear_attn_layers);
+    fprintf(stderr, "  n_linear_k_heads: %d\n", config->n_linear_k_heads);
+    fprintf(stderr, "  n_linear_v_heads: %d\n", config->n_linear_v_heads);
+    fprintf(stderr, "  d_linear_k: %d\n", config->d_linear_k);
+    fprintf(stderr, "  d_linear_v: %d\n", config->d_linear_v);
+    fprintf(stderr, "  linear_conv_kernel: %d\n", config->linear_conv_kernel);
+
+    return 0;
 }
 
-void build_qwen35(Qwen35 *t, char* checkpoint_path) {
-    read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size, &t->layer_types, &t->attn_layer_indices, &t->deltanet_layer_indices);
+static float* load_tensor_alloc(const csafetensors_t *st, const char *name, size_t expected_size) {
+    const csafetensors_tensor_t *tensor = csafetensors_get_tensor(st, name);
+    if (!tensor) return NULL;
+
+    size_t num_elements = csafetensors_shape_size(tensor);
+    float *output = (float *)malloc(num_elements * sizeof(float));
+    if (!output) return NULL;
+
+    if (load_tensor_auto(st, name, output, expected_size) != 0) {
+        free(output);
+        return NULL;
+    }
+    return output;
+}
+
+int load_weights_from_safetensors(Qwen35 *model, const char *model_dir) {
+    Config *p = &model->config;
+    Weights *w = &model->weights;
+
+    char *safetensors_path = get_safetensors_path(model_dir);
+    if (!safetensors_path) {
+        fprintf(stderr, "Could not find safetensors file in %s\n", model_dir);
+        return -1;
+    }
+
+    fprintf(stderr, "Loading weights from %s\n", safetensors_path);
+
+    csafetensors_error_t err = csafetensors_load_from_file(safetensors_path, &model->safetensors);
+    if (err != CSAFETENSORS_SUCCESS) {
+        fprintf(stderr, "Failed to load safetensors: %s\n", csafetensors_get_error(&model->safetensors));
+        return -1;
+    }
+
+    model->use_safetensors = 1;
+
+    fprintf(stderr, "Loaded %zu tensors\n", model->safetensors.n_tensors);
+
+    int head_size     = p->d_head > 0 ? p->d_head : p->dim / p->n_heads;
+    int kv_dim        = p->n_kv_heads * head_size;
+    int key_dim       = p->n_linear_k_heads * p->d_linear_k;
+    int value_dim     = p->n_linear_v_heads * p->d_linear_v;
+    int conv_dim      = key_dim * 2 + value_dim;
+    int q_dim         = p->n_heads * head_size * 2;
+    int attn_out_dim  = p->n_heads * head_size;
+    int n_full_attn   = p->n_full_attn_layers;
+    int n_linear_attn = p->n_linear_attn_layers;
+
+    fprintf(stderr, "Loading embedding weights...\n");
+    w->token_embedding_table = load_tensor_alloc(&model->safetensors, "model.embed_tokens.weight", 0);
+    if (!w->token_embedding_table) {
+        w->token_embedding_table = load_tensor_alloc(&model->safetensors, "model.language_model.embed_tokens.weight", 0);
+    }
+
+    fprintf(stderr, "Loading attention layers...\n");
+    w->rms_att_weight = (float *)malloc((size_t)p->n_layer * p->dim * sizeof(float));
+    w->wq = (float *)malloc((size_t)n_full_attn * p->dim * q_dim * sizeof(float));
+    w->wk = (float *)malloc((size_t)n_full_attn * p->dim * kv_dim * sizeof(float));
+    w->wv = (float *)malloc((size_t)n_full_attn * p->dim * kv_dim * sizeof(float));
+    w->wo = (float *)malloc((size_t)n_full_attn * attn_out_dim * p->dim * sizeof(float));
+    w->q_norm = (float *)malloc((size_t)n_full_attn * head_size * sizeof(float));
+    w->k_norm = (float *)malloc((size_t)n_full_attn * head_size * sizeof(float));
+
+    int la = 0, ld = 0;
+    for (int l = 0; l < p->n_layer; l++) {
+        char name[256];
+
+        snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", l);
+        if (load_tensor_auto(&model->safetensors, name, w->rms_att_weight + l * p->dim, p->dim) != 0) {
+            snprintf(name, sizeof(name), "model.language_model.layers.%d.input_layernorm.weight", l);
+            load_tensor_auto(&model->safetensors, name, w->rms_att_weight + l * p->dim, p->dim);
+        }
+
+        int layer_type = model->layer_types[l];
+
+        if (layer_type == 0) {
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", l);
+            if (load_tensor_auto(&model->safetensors, name, w->wq + la * p->dim * q_dim, 0) != 0) {
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.q_proj.weight", l);
+                load_tensor_auto(&model->safetensors, name, w->wq + la * p->dim * q_dim, 0);
+            }
+
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", l);
+            if (load_tensor_auto(&model->safetensors, name, w->wk + la * p->dim * kv_dim, 0) != 0) {
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.k_proj.weight", l);
+                load_tensor_auto(&model->safetensors, name, w->wk + la * p->dim * kv_dim, 0);
+            }
+
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", l);
+            if (load_tensor_auto(&model->safetensors, name, w->wv + la * p->dim * kv_dim, 0) != 0) {
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.v_proj.weight", l);
+                load_tensor_auto(&model->safetensors, name, w->wv + la * p->dim * kv_dim, 0);
+            }
+
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", l);
+            if (load_tensor_auto(&model->safetensors, name, w->wo + la * attn_out_dim * p->dim, 0) != 0) {
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.o_proj.weight", l);
+                load_tensor_auto(&model->safetensors, name, w->wo + la * attn_out_dim * p->dim, 0);
+            }
+
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", l);
+            if (load_tensor_auto(&model->safetensors, name, w->q_norm + la * head_size, 0) != 0) {
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.q_norm.weight", l);
+                load_tensor_auto(&model->safetensors, name, w->q_norm + la * head_size, 0);
+            }
+
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", l);
+            if (load_tensor_auto(&model->safetensors, name, w->k_norm + la * head_size, 0) != 0) {
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.k_norm.weight", l);
+                load_tensor_auto(&model->safetensors, name, w->k_norm + la * head_size, 0);
+            }
+
+            la++;
+        }
+    }
+
+    if (n_linear_attn > 0) {
+        fprintf(stderr, "Loading linear attention layers...\n");
+        w->in_proj_qkv = (float *)malloc((size_t)n_linear_attn * conv_dim * p->dim * sizeof(float));
+        w->in_proj_z   = (float *)malloc((size_t)n_linear_attn * value_dim * p->dim * sizeof(float));
+        w->in_proj_b   = (float *)malloc((size_t)n_linear_attn * p->n_linear_v_heads * p->dim * sizeof(float));
+        w->in_proj_a   = (float *)malloc((size_t)n_linear_attn * p->n_linear_v_heads * p->dim * sizeof(float));
+        w->conv1d_weight = (float *)malloc((size_t)n_linear_attn * conv_dim * p->linear_conv_kernel * sizeof(float));
+        w->dt_bias     = (float *)malloc((size_t)n_linear_attn * p->n_linear_v_heads * sizeof(float));
+        w->A_log       = (float *)malloc((size_t)n_linear_attn * p->n_linear_v_heads * sizeof(float));
+        w->linear_norm = (float *)malloc((size_t)n_linear_attn * p->d_linear_v * sizeof(float));
+        w->out_proj    = (float *)malloc((size_t)n_linear_attn * p->dim * value_dim * sizeof(float));
+
+        ld = 0;
+        for (int l = 0; l < p->n_layer; l++) {
+            if (model->layer_types[l] != 1) continue;
+
+            char name[256];
+
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.weight", l);
+            if (load_tensor_auto(&model->safetensors, name, w->in_proj_qkv + ld * conv_dim * p->dim, 0) != 0) {
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_qkv.weight", l);
+                load_tensor_auto(&model->safetensors, name, w->in_proj_qkv + ld * conv_dim * p->dim, 0);
+            }
+
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.weight", l);
+            if (load_tensor_auto(&model->safetensors, name, w->in_proj_z + ld * value_dim * p->dim, 0) != 0) {
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_z.weight", l);
+                load_tensor_auto(&model->safetensors, name, w->in_proj_z + ld * value_dim * p->dim, 0);
+            }
+
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.weight", l);
+            if (load_tensor_auto(&model->safetensors, name, w->in_proj_b + ld * p->n_linear_v_heads * p->dim, 0) != 0) {
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_b.weight", l);
+                load_tensor_auto(&model->safetensors, name, w->in_proj_b + ld * p->n_linear_v_heads * p->dim, 0);
+            }
+
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.weight", l);
+            if (load_tensor_auto(&model->safetensors, name, w->in_proj_a + ld * p->n_linear_v_heads * p->dim, 0) != 0) {
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_a.weight", l);
+                load_tensor_auto(&model->safetensors, name, w->in_proj_a + ld * p->n_linear_v_heads * p->dim, 0);
+            }
+
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.conv1d.weight", l);
+            if (load_tensor_auto(&model->safetensors, name, w->conv1d_weight + ld * conv_dim * p->linear_conv_kernel, 0) != 0) {
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.conv1d.weight", l);
+                load_tensor_auto(&model->safetensors, name, w->conv1d_weight + ld * conv_dim * p->linear_conv_kernel, 0);
+            }
+
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.dt_bias", l);
+            if (load_tensor_auto(&model->safetensors, name, w->dt_bias + ld * p->n_linear_v_heads, 0) != 0) {
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.dt_bias", l);
+                load_tensor_auto(&model->safetensors, name, w->dt_bias + ld * p->n_linear_v_heads, 0);
+            }
+
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.A_log", l);
+            if (load_tensor_auto(&model->safetensors, name, w->A_log + ld * p->n_linear_v_heads, 0) != 0) {
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.A_log", l);
+                load_tensor_auto(&model->safetensors, name, w->A_log + ld * p->n_linear_v_heads, 0);
+            }
+
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.norm.weight", l);
+            if (load_tensor_auto(&model->safetensors, name, w->linear_norm + ld * p->d_linear_v, 0) != 0) {
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.norm.weight", l);
+                load_tensor_auto(&model->safetensors, name, w->linear_norm + ld * p->d_linear_v, 0);
+            }
+
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.weight", l);
+            if (load_tensor_auto(&model->safetensors, name, w->out_proj + ld * p->dim * value_dim, 0) != 0) {
+                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.out_proj.weight", l);
+                load_tensor_auto(&model->safetensors, name, w->out_proj + ld * p->dim * value_dim, 0);
+            }
+
+            ld++;
+        }
+    }
+
+    fprintf(stderr, "Loading FFN weights...\n");
+    w->rms_ffn_weight = (float *)malloc((size_t)p->n_layer * p->dim * sizeof(float));
+    w->w1 = (float *)malloc((size_t)p->n_layer * p->dim * p->n_mlp * sizeof(float));
+    w->w2 = (float *)malloc((size_t)p->n_layer * p->n_mlp * p->dim * sizeof(float));
+    w->w3 = (float *)malloc((size_t)p->n_layer * p->dim * p->n_mlp * sizeof(float));
+
+    for (int l = 0; l < p->n_layer; l++) {
+        char name[256];
+
+        snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", l);
+        if (load_tensor_auto(&model->safetensors, name, w->rms_ffn_weight + l * p->dim, p->dim) != 0) {
+            snprintf(name, sizeof(name), "model.language_model.layers.%d.post_attention_layernorm.weight", l);
+            load_tensor_auto(&model->safetensors, name, w->rms_ffn_weight + l * p->dim, p->dim);
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", l);
+        if (load_tensor_auto(&model->safetensors, name, w->w1 + l * p->dim * p->n_mlp, 0) != 0) {
+            snprintf(name, sizeof(name), "model.language_model.layers.%d.mlp.gate_proj.weight", l);
+            load_tensor_auto(&model->safetensors, name, w->w1 + l * p->dim * p->n_mlp, 0);
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", l);
+        if (load_tensor_auto(&model->safetensors, name, w->w2 + l * p->n_mlp * p->dim, 0) != 0) {
+            snprintf(name, sizeof(name), "model.language_model.layers.%d.mlp.down_proj.weight", l);
+            load_tensor_auto(&model->safetensors, name, w->w2 + l * p->n_mlp * p->dim, 0);
+        }
+
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", l);
+        if (load_tensor_auto(&model->safetensors, name, w->w3 + l * p->dim * p->n_mlp, 0) != 0) {
+            snprintf(name, sizeof(name), "model.language_model.layers.%d.mlp.up_proj.weight", l);
+            load_tensor_auto(&model->safetensors, name, w->w3 + l * p->dim * p->n_mlp, 0);
+        }
+    }
+
+    fprintf(stderr, "Loading final norm...\n");
+    w->rms_final_weight = load_tensor_alloc(&model->safetensors, "model.norm.weight", p->dim);
+    if (!w->rms_final_weight) {
+        w->rms_final_weight = load_tensor_alloc(&model->safetensors, "model.language_model.norm.weight", p->dim);
+    }
+
+    if (!p->tie_word_embeddings) {
+        fprintf(stderr, "Loading lm_head...\n");
+        w->wcls = load_tensor_alloc(&model->safetensors, "lm_head.weight", 0);
+    } else {
+        w->wcls = w->token_embedding_table;
+    }
+
+    fprintf(stderr, "Weights loaded successfully\n");
+    csafetensors_free(&model->safetensors);
+    model->use_safetensors = 0;
+    return 0;
+}
+
+void build_qwen35(Qwen35 *t, char* model_path) {
+    memset(t, 0, sizeof(Qwen35));
+
+    if (load_config(model_path, &t->config) != 0) {
+        fprintf(stderr, "Failed to load config\n");
+        exit(EXIT_FAILURE);
+    }
+
+    t->layer_types = calloc(t->config.n_layer, sizeof(int));
+    t->attn_layer_indices = calloc(t->config.n_layer, sizeof(int));
+    t->deltanet_layer_indices = calloc(t->config.n_layer, sizeof(int));
+
+    char config_path[4096];
+    snprintf(config_path, sizeof(config_path), "%s/config.json", model_path);
+    FILE *f = fopen(config_path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long size = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        char *json_str = (char *)malloc(size + 1);
+        if (json_str && fread(json_str, 1, size, f) == (size_t)size) {
+            json_str[size] = '\0';
+            fclose(f);
+
+            char error[256] = {0};
+            JsonValue *root = json_parse(json_str, size, error, sizeof(error));
+            free(json_str);
+
+            if (root) {
+                JsonValue *cfg = json_object_get(root, "text_config");
+                if (!cfg) cfg = root;
+                JsonValue *layer_types = json_object_get(cfg, "layer_types");
+
+                int la = 0, ld = 0;
+                for (int i = 0; i < t->config.n_layer; i++) {
+                    t->layer_types[i] = get_layer_type(i, layer_types);
+                    if (t->layer_types[i] == 1) {
+                        t->deltanet_layer_indices[i] = ld++;
+                    } else {
+                        t->attn_layer_indices[i] = la++;
+                    }
+                }
+                json_free(root);
+            }
+        } else {
+            if (json_str) free(json_str);
+            if (f) fclose(f);
+        }
+    }
+
+    if (load_weights_from_safetensors(t, model_path) != 0) {
+        fprintf(stderr, "Failed to load weights\n");
+        exit(EXIT_FAILURE);
+    }
+
     malloc_run_state(&t->state, &t->config);
 }
 
 void free_qwen35(Qwen35* t) {
-    if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
-    if (t->fd != -1) { close(t->fd); }
+    Weights *w = &t->weights;
+
+    free(w->data);
+    free(w->token_embedding_table);
+    free(w->rms_att_weight);
+    free(w->wq);
+    free(w->wk);
+    free(w->wv);
+    free(w->wo);
+    free(w->q_norm);
+    free(w->k_norm);
+    free(w->in_proj_qkv);
+    free(w->in_proj_z);
+    free(w->in_proj_b);
+    free(w->in_proj_a);
+    free(w->conv1d_weight);
+    free(w->dt_bias);
+    free(w->A_log);
+    free(w->linear_norm);
+    free(w->out_proj);
+    free(w->rms_ffn_weight);
+    free(w->w1);
+    free(w->w2);
+    free(w->w3);
+    free(w->rms_final_weight);
+    if (!t->config.tie_word_embeddings) {
+        free(w->wcls);
+    }
+
     free_run_state(&t->state);
     free(t->layer_types);
     free(t->attn_layer_indices);
@@ -1324,8 +1721,8 @@ void chat(Qwen35 *model, Tokenizer *tokenizer, Sampler *sampler,
 #ifndef TESTING
 
 void error_usage() {
-    fprintf(stderr, "Usage:   qwen35 <checkpoint> [options]\n");
-    fprintf(stderr, "Example: qwen35 model.bin -y \"You are a helpful assistant.\"\n");
+    fprintf(stderr, "Usage:   qwen35 <model_dir> [options]\n");
+    fprintf(stderr, "Example: qwen35 ./Qwen3.5-0.8B -y \"You are a helpful assistant.\"\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -t <float>  temperature in [0,inf], default 0 (greedy argmax)\n");
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
@@ -1340,7 +1737,7 @@ void error_usage() {
 
 int main(int argc, char *argv[]) {
 
-    char *checkpoint_path = NULL;
+    char *model_path = NULL;
     char *tokenizer_path = "tokenizer.bin";
     float temperature = 0.0f;
     float topp = 0.9f;
@@ -1350,7 +1747,7 @@ int main(int argc, char *argv[]) {
     char *mode = "chat";
     char *system_prompt = NULL;
 
-    if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
+    if (argc >= 2) { model_path = argv[1]; } else { error_usage(); }
     for (int i = 2; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); }
         if (argv[i][0] != '-') { error_usage(); }
@@ -1372,10 +1769,19 @@ int main(int argc, char *argv[]) {
     if (steps < 0) steps = 0;
 
     Qwen35 model;
-    build_qwen35(&model, checkpoint_path);
+    build_qwen35(&model, model_path);
     if (steps == 0 || steps > model.config.seq_len) steps = model.config.seq_len;
 
     Tokenizer tokenizer;
+    char tokenizer_full_path[4096];
+    if (tokenizer_path[0] != '/') {
+        snprintf(tokenizer_full_path, sizeof(tokenizer_full_path), "%s/%s", model_path, tokenizer_path);
+        FILE *f = fopen(tokenizer_full_path, "rb");
+        if (f) {
+            fclose(f);
+            tokenizer_path = tokenizer_full_path;
+        }
+    }
     build_tokenizer(&tokenizer, tokenizer_path, model.config.vocab_size);
 
     Sampler sampler;
