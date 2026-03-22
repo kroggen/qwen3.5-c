@@ -86,8 +86,8 @@ typedef struct {
     float *beta;
     float *g;
     float *linear_out;
-    float *S;
     float *conv_state;
+    float *S;
     float *delta_S;
 } RunState;
 
@@ -99,7 +99,6 @@ typedef struct {
     int* attn_layer_indices;
     int* deltanet_layer_indices;
     csafetensors_t safetensors;
-    int use_safetensors;
 } Qwen35;
 
 void malloc_run_state(RunState* s, Config* p) {
@@ -138,9 +137,9 @@ void malloc_run_state(RunState* s, Config* p) {
         s->beta       = calloc(p->n_linear_v_heads, sizeof(float));
         s->g          = calloc(p->n_linear_v_heads, sizeof(float));
         s->linear_out = calloc(value_dim, sizeof(float));
-        s->delta_S    = calloc(p->n_linear_v_heads * p->d_linear_k * p->d_linear_v, sizeof(float));
-        s->S          = calloc(n_linear_layers * p->n_linear_v_heads * p->d_linear_k * p->d_linear_v, sizeof(float));
         s->conv_state = calloc(n_linear_layers * (key_dim * 2 + value_dim) * p->linear_conv_kernel, sizeof(float));
+        s->S          = calloc(n_linear_layers * p->n_linear_v_heads * p->d_linear_k * p->d_linear_v, sizeof(float));
+        s->delta_S    = calloc(p->n_linear_v_heads * p->d_linear_k * p->d_linear_v, sizeof(float));
     }
 
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
@@ -170,8 +169,8 @@ void free_run_state(RunState* s) {
     free(s->beta);
     free(s->g);
     free(s->linear_out);
-    free(s->S);
     free(s->conv_state);
+    free(s->S);
     free(s->delta_S);
 }
 
@@ -423,8 +422,6 @@ int load_weights_from_safetensors(Qwen35 *model, const char *model_dir) {
         return -1;
     }
 
-    model->use_safetensors = 1;
-
     fprintf(stderr, "Loaded %zu tensors\n", model->safetensors.n_tensors);
 
     int head_size     = p->d_head > 0 ? p->d_head : p->dim / p->n_heads;
@@ -630,7 +627,6 @@ int load_weights_from_safetensors(Qwen35 *model, const char *model_dir) {
 
     fprintf(stderr, "Weights loaded successfully\n");
     csafetensors_free(&model->safetensors);
-    model->use_safetensors = 0;
     return 0;
 }
 
