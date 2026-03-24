@@ -13,7 +13,6 @@
 #else
     #include <unistd.h>
     #include <sys/mman.h>
-    #include <dirent.h>
 #endif
 
 #include "csafetensors.h"
@@ -92,13 +91,27 @@ typedef struct {
 } RunState;
 
 typedef struct {
+    char *tensor_name;
+    char *filename;
+} WeightMapEntry;
+
+typedef struct {
+    WeightMapEntry *entries;
+    size_t n_entries;
+    csafetensors_t *files;
+    char **filenames;
+    int n_files;
+    char *model_dir;
+} SafetensorsIndex;
+
+typedef struct {
     Config config;
     Weights weights;
     RunState state;
     int* layer_types;
     int* attn_layer_indices;
     int* deltanet_layer_indices;
-    csafetensors_t safetensors;
+    SafetensorsIndex index;
 } Qwen35;
 
 void malloc_run_state(RunState* s, Config* p) {
@@ -174,39 +187,6 @@ void free_run_state(RunState* s) {
     free(s->delta_S);
 }
 
-static int load_tensor_auto(const csafetensors_t *st, const char *name, float *dest, size_t expected_size) {
-    const csafetensors_tensor_t *tensor = csafetensors_get_tensor(st, name);
-    if (!tensor) return -1;
-
-    const uint8_t *data = csafetensors_get_tensor_data(st, tensor);
-    if (!data) return -1;
-
-    size_t num_elements = csafetensors_shape_size(tensor);
-
-    if (expected_size > 0 && num_elements != expected_size) {
-        fprintf(stderr, "Tensor %s size mismatch: got %zu, expected %zu\n", name, num_elements, expected_size);
-    }
-
-    if (tensor->dtype == CSAFETENSORS_DTYPE_BFLOAT16) {
-        const uint16_t *bf16_data = (const uint16_t *)data;
-        for (size_t i = 0; i < num_elements; i++) {
-            dest[i] = csafetensors_bf16_to_f32(bf16_data[i]);
-        }
-    } else if (tensor->dtype == CSAFETENSORS_DTYPE_FLOAT16) {
-        const uint16_t *f16_data = (const uint16_t *)data;
-        for (size_t i = 0; i < num_elements; i++) {
-            dest[i] = csafetensors_f16_to_f32(f16_data[i]);
-        }
-    } else if (tensor->dtype == CSAFETENSORS_DTYPE_FLOAT32) {
-        memcpy(dest, data, num_elements * sizeof(float));
-    } else {
-        fprintf(stderr, "Unsupported dtype for tensor %s\n", name);
-        return -1;
-    }
-
-    return 0;
-}
-
 static int get_layer_type(int layer_idx, const JsonValue *layer_types) {
     if (!layer_types || layer_types->type != JSON_ARRAY) return 0;
     if (layer_idx >= (int)layer_types->data.array.count) return 0;
@@ -215,77 +195,6 @@ static int get_layer_type(int layer_idx, const JsonValue *layer_types) {
     const char *type_str = lt->data.string;
     if (strcmp(type_str, "linear_attention") == 0) return 1;
     return 0;
-}
-
-static char* find_file_in_dir(const char *dir, const char *name) {
-    static char path[4096];
-    snprintf(path, sizeof(path), "%s/%s", dir, name);
-    FILE *f = fopen(path, "rb");
-    if (f) {
-        fclose(f);
-        return path;
-    }
-    return NULL;
-}
-
-static int ends_with_safetensors(const char *name) {
-    size_t len = strlen(name);
-    return len > 12 && strcmp(name + len - 12, ".safetensors") == 0;
-}
-
-static int starts_with_model(const char *name) {
-    return strncmp(name, "model", 5) == 0;
-}
-
-static int compare_strings(const void *a, const void *b) {
-    return strcmp(*(const char**)a, *(const char**)b);
-}
-
-static char** find_safetensors_files(const char *model_dir, int *count) {
-    DIR *dir = opendir(model_dir);
-    if (!dir) return NULL;
-
-    char **files = NULL;
-    *count = 0;
-    int capacity = 0;
-
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type != DT_REG && entry->d_type != DT_LNK) continue;
-        if (!starts_with_model(entry->d_name)) continue;
-        if (!ends_with_safetensors(entry->d_name)) continue;
-
-        if (*count >= capacity) {
-            capacity = capacity ? capacity * 2 : 16;
-            files = realloc(files, capacity * sizeof(char*));
-        }
-        files[*count] = strdup(entry->d_name);
-        (*count)++;
-    }
-    closedir(dir);
-
-    if (*count == 0) {
-        free(files);
-        return NULL;
-    }
-
-    qsort(files, *count, sizeof(char*), compare_strings);
-    return files;
-}
-
-static char* get_safetensors_path(const char *model_dir) {
-    static char path[4096];
-
-    int count;
-    char **files = find_safetensors_files(model_dir, &count);
-    if (!files) return NULL;
-
-    snprintf(path, sizeof(path), "%s/%s", model_dir, files[0]);
-
-    for (int i = 0; i < count; i++) free(files[i]);
-    free(files);
-
-    return path;
 }
 
 int load_config(const char *model_dir, Config *config) {
@@ -389,40 +298,177 @@ int load_config(const char *model_dir, Config *config) {
     return 0;
 }
 
-static float* load_tensor_alloc(const csafetensors_t *st, const char *name, size_t expected_size) {
+static const char *find_filename_for_tensor(SafetensorsIndex *idx, const char *tensor_name) {
+    for (size_t i = 0; i < idx->n_entries; i++) {
+        if (strcmp(idx->entries[i].tensor_name, tensor_name) == 0) {
+            return idx->entries[i].filename;
+        }
+    }
+    return NULL;
+}
+
+static csafetensors_t *get_or_load_file(SafetensorsIndex *idx, const char *filename) {
+    for (int i = 0; i < idx->n_files; i++) {
+        if (strcmp(idx->filenames[i], filename) == 0) {
+            return &idx->files[i];
+        }
+    }
+
+    int new_idx = idx->n_files;
+    idx->n_files++;
+    idx->files = (csafetensors_t *)realloc(idx->files, idx->n_files * sizeof(csafetensors_t));
+    idx->filenames = (char **)realloc(idx->filenames, idx->n_files * sizeof(char *));
+
+    char filepath[4096];
+    snprintf(filepath, sizeof(filepath), "%s/%s", idx->model_dir, filename);
+
+    fprintf(stderr, "Loading %s\n", filename);
+    csafetensors_error_t err = csafetensors_load_from_file(filepath, &idx->files[new_idx]);
+    if (err != CSAFETENSORS_SUCCESS) {
+        fprintf(stderr, "Failed to load %s: %s\n", filepath, csafetensors_get_error(&idx->files[new_idx]));
+        idx->n_files--;
+        return NULL;
+    }
+
+    idx->filenames[new_idx] = strdup(filename);
+    return &idx->files[new_idx];
+}
+
+static float* load_tensor(SafetensorsIndex *idx, const char *name, float *dest, size_t expected_size) {
+    const char *filename = find_filename_for_tensor(idx, name);
+    if (!filename) return NULL;
+
+    csafetensors_t *st = get_or_load_file(idx, filename);
+    if (!st) return NULL;
+
     const csafetensors_tensor_t *tensor = csafetensors_get_tensor(st, name);
     if (!tensor) return NULL;
 
-    size_t num_elements = csafetensors_shape_size(tensor);
-    float *output = (float *)malloc(num_elements * sizeof(float));
-    if (!output) return NULL;
+    const uint8_t *data = csafetensors_get_tensor_data(st, tensor);
+    if (!data) return NULL;
 
-    if (load_tensor_auto(st, name, output, expected_size) != 0) {
-        free(output);
+    size_t num_elements = csafetensors_shape_size(tensor);
+
+    if (expected_size > 0 && num_elements != expected_size) {
+        fprintf(stderr, "Tensor %s size mismatch: got %zu, expected %zu\n", name, num_elements, expected_size);
+    }
+
+    float *output = dest;
+    if (!dest) {
+        output = (float *)malloc(num_elements * sizeof(float));
+        if (!output) return NULL;
+    }
+
+    if (tensor->dtype == CSAFETENSORS_DTYPE_BFLOAT16) {
+        const uint16_t *bf16_data = (const uint16_t *)data;
+        for (size_t i = 0; i < num_elements; i++) {
+            output[i] = csafetensors_bf16_to_f32(bf16_data[i]);
+        }
+    } else if (tensor->dtype == CSAFETENSORS_DTYPE_FLOAT16) {
+        const uint16_t *f16_data = (const uint16_t *)data;
+        for (size_t i = 0; i < num_elements; i++) {
+            output[i] = csafetensors_f16_to_f32(f16_data[i]);
+        }
+    } else if (tensor->dtype == CSAFETENSORS_DTYPE_FLOAT32) {
+        memcpy(output, data, num_elements * sizeof(float));
+    } else {
+        fprintf(stderr, "Unsupported dtype for tensor %s\n", name);
+        if (!dest) free(output);
         return NULL;
     }
+
     return output;
+}
+
+static float* load_layer_tensor(SafetensorsIndex *idx, int l, const char *suffix, float *dest, size_t expected_size) {
+    char name[256];
+    snprintf(name, sizeof(name), "model.language_model.layers.%d.%s", l, suffix);
+    return load_tensor(idx, name, dest, expected_size);
+}
+
+static void free_safetensors_index(SafetensorsIndex *idx) {
+    for (size_t i = 0; i < idx->n_entries; i++) {
+        free(idx->entries[i].tensor_name);
+        free(idx->entries[i].filename);
+    }
+    free(idx->entries);
+    for (int i = 0; i < idx->n_files; i++) {
+        csafetensors_free(&idx->files[i]);
+        free(idx->filenames[i]);
+    }
+    free(idx->files);
+    free(idx->filenames);
+    free(idx->model_dir);
+    memset(idx, 0, sizeof(SafetensorsIndex));
+}
+
+static int load_safetensors_index(SafetensorsIndex *idx, const char *model_dir) {
+    char index_path[4096];
+    snprintf(index_path, sizeof(index_path), "%s/model.safetensors.index.json", model_dir);
+
+    FILE *f = fopen(index_path, "rb");
+    if (!f) return -1;
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    char *json_str = (char *)malloc(size + 1);
+    if (!json_str) { fclose(f); return -1; }
+
+    if (fread(json_str, 1, size, f) != (size_t)size) {
+        free(json_str);
+        fclose(f);
+        return -1;
+    }
+    json_str[size] = '\0';
+    fclose(f);
+
+    char error[256] = {0};
+    JsonValue *root = json_parse(json_str, size, error, sizeof(error));
+    free(json_str);
+    if (!root) return -1;
+
+    JsonValue *weight_map = json_object_get(root, "weight_map");
+    if (!weight_map || weight_map->type != JSON_OBJECT) {
+        json_free(root);
+        return -1;
+    }
+
+    idx->n_entries = weight_map->data.object.count;
+    idx->entries = (WeightMapEntry *)calloc(idx->n_entries, sizeof(WeightMapEntry));
+    if (!idx->entries) {
+        json_free(root);
+        return -1;
+    }
+
+    for (size_t i = 0; i < idx->n_entries; i++) {
+        JsonPair *pair = &weight_map->data.object.pairs[i];
+        idx->entries[i].tensor_name = strdup(pair->key);
+        idx->entries[i].filename = strdup(pair->value->data.string);
+    }
+
+    idx->model_dir = strdup(model_dir);
+    idx->files = NULL;
+    idx->filenames = NULL;
+    idx->n_files = 0;
+
+    json_free(root);
+    return 0;
 }
 
 int load_weights_from_safetensors(Qwen35 *model, const char *model_dir) {
     Config *p = &model->config;
     Weights *w = &model->weights;
+    SafetensorsIndex *idx = &model->index;
 
-    char *safetensors_path = get_safetensors_path(model_dir);
-    if (!safetensors_path) {
-        fprintf(stderr, "Could not find safetensors file in %s\n", model_dir);
+    if (load_safetensors_index(idx, model_dir) != 0) {
+        fprintf(stderr, "Error: Could not find model.safetensors.index.json in %s\n", model_dir);
+        fprintf(stderr, "This file is required to locate weight tensors.\n");
         return -1;
     }
 
-    fprintf(stderr, "Loading weights from %s\n", safetensors_path);
-
-    csafetensors_error_t err = csafetensors_load_from_file(safetensors_path, &model->safetensors);
-    if (err != CSAFETENSORS_SUCCESS) {
-        fprintf(stderr, "Failed to load safetensors: %s\n", csafetensors_get_error(&model->safetensors));
-        return -1;
-    }
-
-    fprintf(stderr, "File has %zu tensors\n", model->safetensors.n_tensors);
+    fprintf(stderr, "Found model.safetensors.index.json with %zu tensors\n", idx->n_entries);
 
     int head_size     = p->d_head > 0 ? p->d_head : p->dim / p->n_heads;
     int kv_dim        = p->n_kv_heads * head_size;
@@ -435,10 +481,7 @@ int load_weights_from_safetensors(Qwen35 *model, const char *model_dir) {
     int n_linear_attn = p->n_linear_attn_layers;
 
     fprintf(stderr, "Loading embedding weights...\n");
-    w->token_embedding_table = load_tensor_alloc(&model->safetensors, "model.embed_tokens.weight", 0);
-    if (!w->token_embedding_table) {
-        w->token_embedding_table = load_tensor_alloc(&model->safetensors, "model.language_model.embed_tokens.weight", 0);
-    }
+    w->token_embedding_table = load_tensor(idx, "model.language_model.embed_tokens.weight", NULL, 0);
 
     fprintf(stderr, "Loading full attention layers...\n");
     w->rms_att_weight = (float *)malloc((size_t)p->n_layer * p->dim * sizeof(float));
@@ -449,55 +492,17 @@ int load_weights_from_safetensors(Qwen35 *model, const char *model_dir) {
     w->q_norm = (float *)malloc((size_t)n_full_attn * head_size * sizeof(float));
     w->k_norm = (float *)malloc((size_t)n_full_attn * head_size * sizeof(float));
 
-    int la = 0, ld = 0;
+    int la = 0;
     for (int l = 0; l < p->n_layer; l++) {
-        char name[256];
+        load_layer_tensor(idx, l, "input_layernorm.weight", w->rms_att_weight + l * p->dim, p->dim);
 
-        snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", l);
-        if (load_tensor_auto(&model->safetensors, name, w->rms_att_weight + l * p->dim, p->dim) != 0) {
-            snprintf(name, sizeof(name), "model.language_model.layers.%d.input_layernorm.weight", l);
-            load_tensor_auto(&model->safetensors, name, w->rms_att_weight + l * p->dim, p->dim);
-        }
-
-        int layer_type = model->layer_types[l];
-
-        if (layer_type == 0) {
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", l);
-            if (load_tensor_auto(&model->safetensors, name, w->wq + la * p->dim * q_dim, 0) != 0) {
-                snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.q_proj.weight", l);
-                load_tensor_auto(&model->safetensors, name, w->wq + la * p->dim * q_dim, 0);
-            }
-
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", l);
-            if (load_tensor_auto(&model->safetensors, name, w->wk + la * p->dim * kv_dim, 0) != 0) {
-                snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.k_proj.weight", l);
-                load_tensor_auto(&model->safetensors, name, w->wk + la * p->dim * kv_dim, 0);
-            }
-
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", l);
-            if (load_tensor_auto(&model->safetensors, name, w->wv + la * p->dim * kv_dim, 0) != 0) {
-                snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.v_proj.weight", l);
-                load_tensor_auto(&model->safetensors, name, w->wv + la * p->dim * kv_dim, 0);
-            }
-
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", l);
-            if (load_tensor_auto(&model->safetensors, name, w->wo + la * attn_out_dim * p->dim, 0) != 0) {
-                snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.o_proj.weight", l);
-                load_tensor_auto(&model->safetensors, name, w->wo + la * attn_out_dim * p->dim, 0);
-            }
-
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", l);
-            if (load_tensor_auto(&model->safetensors, name, w->q_norm + la * head_size, 0) != 0) {
-                snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.q_norm.weight", l);
-                load_tensor_auto(&model->safetensors, name, w->q_norm + la * head_size, 0);
-            }
-
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", l);
-            if (load_tensor_auto(&model->safetensors, name, w->k_norm + la * head_size, 0) != 0) {
-                snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.k_norm.weight", l);
-                load_tensor_auto(&model->safetensors, name, w->k_norm + la * head_size, 0);
-            }
-
+        if (model->layer_types[l] == 0) {
+            load_layer_tensor(idx, l, "self_attn.q_proj.weight", w->wq + la * p->dim * q_dim, 0);
+            load_layer_tensor(idx, l, "self_attn.k_proj.weight", w->wk + la * p->dim * kv_dim, 0);
+            load_layer_tensor(idx, l, "self_attn.v_proj.weight", w->wv + la * p->dim * kv_dim, 0);
+            load_layer_tensor(idx, l, "self_attn.o_proj.weight", w->wo + la * attn_out_dim * p->dim, 0);
+            load_layer_tensor(idx, l, "self_attn.q_norm.weight", w->q_norm + la * head_size, 0);
+            load_layer_tensor(idx, l, "self_attn.k_norm.weight", w->k_norm + la * head_size, 0);
             la++;
         }
     }
@@ -514,66 +519,19 @@ int load_weights_from_safetensors(Qwen35 *model, const char *model_dir) {
         w->linear_norm = (float *)malloc((size_t)n_linear_attn * p->d_linear_v * sizeof(float));
         w->out_proj    = (float *)malloc((size_t)n_linear_attn * p->dim * value_dim * sizeof(float));
 
-        ld = 0;
+        int ld = 0;
         for (int l = 0; l < p->n_layer; l++) {
             if (model->layer_types[l] != 1) continue;
 
-            char name[256];
-
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.weight", l);
-            if (load_tensor_auto(&model->safetensors, name, w->in_proj_qkv + ld * conv_dim * p->dim, 0) != 0) {
-                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_qkv.weight", l);
-                load_tensor_auto(&model->safetensors, name, w->in_proj_qkv + ld * conv_dim * p->dim, 0);
-            }
-
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.weight", l);
-            if (load_tensor_auto(&model->safetensors, name, w->in_proj_z + ld * value_dim * p->dim, 0) != 0) {
-                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_z.weight", l);
-                load_tensor_auto(&model->safetensors, name, w->in_proj_z + ld * value_dim * p->dim, 0);
-            }
-
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.weight", l);
-            if (load_tensor_auto(&model->safetensors, name, w->in_proj_b + ld * p->n_linear_v_heads * p->dim, 0) != 0) {
-                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_b.weight", l);
-                load_tensor_auto(&model->safetensors, name, w->in_proj_b + ld * p->n_linear_v_heads * p->dim, 0);
-            }
-
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.weight", l);
-            if (load_tensor_auto(&model->safetensors, name, w->in_proj_a + ld * p->n_linear_v_heads * p->dim, 0) != 0) {
-                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_a.weight", l);
-                load_tensor_auto(&model->safetensors, name, w->in_proj_a + ld * p->n_linear_v_heads * p->dim, 0);
-            }
-
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.conv1d.weight", l);
-            if (load_tensor_auto(&model->safetensors, name, w->conv1d_weight + ld * conv_dim * p->linear_conv_kernel, 0) != 0) {
-                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.conv1d.weight", l);
-                load_tensor_auto(&model->safetensors, name, w->conv1d_weight + ld * conv_dim * p->linear_conv_kernel, 0);
-            }
-
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.dt_bias", l);
-            if (load_tensor_auto(&model->safetensors, name, w->dt_bias + ld * p->n_linear_v_heads, 0) != 0) {
-                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.dt_bias", l);
-                load_tensor_auto(&model->safetensors, name, w->dt_bias + ld * p->n_linear_v_heads, 0);
-            }
-
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.A_log", l);
-            if (load_tensor_auto(&model->safetensors, name, w->A_log + ld * p->n_linear_v_heads, 0) != 0) {
-                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.A_log", l);
-                load_tensor_auto(&model->safetensors, name, w->A_log + ld * p->n_linear_v_heads, 0);
-            }
-
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.norm.weight", l);
-            if (load_tensor_auto(&model->safetensors, name, w->linear_norm + ld * p->d_linear_v, 0) != 0) {
-                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.norm.weight", l);
-                load_tensor_auto(&model->safetensors, name, w->linear_norm + ld * p->d_linear_v, 0);
-            }
-
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.weight", l);
-            if (load_tensor_auto(&model->safetensors, name, w->out_proj + ld * p->dim * value_dim, 0) != 0) {
-                snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.out_proj.weight", l);
-                load_tensor_auto(&model->safetensors, name, w->out_proj + ld * p->dim * value_dim, 0);
-            }
-
+            load_layer_tensor(idx, l, "linear_attn.in_proj_qkv.weight", w->in_proj_qkv + ld * conv_dim * p->dim, 0);
+            load_layer_tensor(idx, l, "linear_attn.in_proj_z.weight", w->in_proj_z + ld * value_dim * p->dim, 0);
+            load_layer_tensor(idx, l, "linear_attn.in_proj_b.weight", w->in_proj_b + ld * p->n_linear_v_heads * p->dim, 0);
+            load_layer_tensor(idx, l, "linear_attn.in_proj_a.weight", w->in_proj_a + ld * p->n_linear_v_heads * p->dim, 0);
+            load_layer_tensor(idx, l, "linear_attn.conv1d.weight", w->conv1d_weight + ld * conv_dim * p->linear_conv_kernel, 0);
+            load_layer_tensor(idx, l, "linear_attn.dt_bias", w->dt_bias + ld * p->n_linear_v_heads, 0);
+            load_layer_tensor(idx, l, "linear_attn.A_log", w->A_log + ld * p->n_linear_v_heads, 0);
+            load_layer_tensor(idx, l, "linear_attn.norm.weight", w->linear_norm + ld * p->d_linear_v, 0);
+            load_layer_tensor(idx, l, "linear_attn.out_proj.weight", w->out_proj + ld * p->dim * value_dim, 0);
             ld++;
         }
     }
@@ -585,48 +543,24 @@ int load_weights_from_safetensors(Qwen35 *model, const char *model_dir) {
     w->w3 = (float *)malloc((size_t)p->n_layer * p->dim * p->n_mlp * sizeof(float));
 
     for (int l = 0; l < p->n_layer; l++) {
-        char name[256];
-
-        snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", l);
-        if (load_tensor_auto(&model->safetensors, name, w->rms_ffn_weight + l * p->dim, p->dim) != 0) {
-            snprintf(name, sizeof(name), "model.language_model.layers.%d.post_attention_layernorm.weight", l);
-            load_tensor_auto(&model->safetensors, name, w->rms_ffn_weight + l * p->dim, p->dim);
-        }
-
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", l);
-        if (load_tensor_auto(&model->safetensors, name, w->w1 + l * p->dim * p->n_mlp, 0) != 0) {
-            snprintf(name, sizeof(name), "model.language_model.layers.%d.mlp.gate_proj.weight", l);
-            load_tensor_auto(&model->safetensors, name, w->w1 + l * p->dim * p->n_mlp, 0);
-        }
-
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", l);
-        if (load_tensor_auto(&model->safetensors, name, w->w2 + l * p->n_mlp * p->dim, 0) != 0) {
-            snprintf(name, sizeof(name), "model.language_model.layers.%d.mlp.down_proj.weight", l);
-            load_tensor_auto(&model->safetensors, name, w->w2 + l * p->n_mlp * p->dim, 0);
-        }
-
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", l);
-        if (load_tensor_auto(&model->safetensors, name, w->w3 + l * p->dim * p->n_mlp, 0) != 0) {
-            snprintf(name, sizeof(name), "model.language_model.layers.%d.mlp.up_proj.weight", l);
-            load_tensor_auto(&model->safetensors, name, w->w3 + l * p->dim * p->n_mlp, 0);
-        }
+        load_layer_tensor(idx, l, "post_attention_layernorm.weight", w->rms_ffn_weight + l * p->dim, p->dim);
+        load_layer_tensor(idx, l, "mlp.gate_proj.weight", w->w1 + l * p->dim * p->n_mlp, 0);
+        load_layer_tensor(idx, l, "mlp.down_proj.weight", w->w2 + l * p->n_mlp * p->dim, 0);
+        load_layer_tensor(idx, l, "mlp.up_proj.weight",   w->w3 + l * p->dim * p->n_mlp, 0);
     }
 
     fprintf(stderr, "Loading final norm...\n");
-    w->rms_final_weight = load_tensor_alloc(&model->safetensors, "model.norm.weight", p->dim);
-    if (!w->rms_final_weight) {
-        w->rms_final_weight = load_tensor_alloc(&model->safetensors, "model.language_model.norm.weight", p->dim);
-    }
+    w->rms_final_weight = load_tensor(idx, "model.language_model.norm.weight", NULL, p->dim);
 
     if (!p->tie_word_embeddings) {
         fprintf(stderr, "Loading lm_head...\n");
-        w->wcls = load_tensor_alloc(&model->safetensors, "lm_head.weight", 0);
+        w->wcls = load_tensor(idx, "lm_head.weight", NULL, 0);
     } else {
         w->wcls = w->token_embedding_table;
     }
 
     fprintf(stderr, "Weights loaded successfully\n");
-    csafetensors_free(&model->safetensors);
+    free_safetensors_index(idx);
     return 0;
 }
 
