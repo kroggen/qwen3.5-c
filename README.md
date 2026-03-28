@@ -13,7 +13,7 @@ Qwen 3.5 combines multi-head attention and linear attention (GatedDeltaNet) laye
 For fast inference, use other methods like [qwen3.5-triton](https://github.com/RightNow-AI/qwen3.5-triton)
 
 
-## Fast Start
+## Quick Start
 
 ```bash
 pip install huggingface_hub transformers
@@ -44,16 +44,16 @@ Examples:
 * Qwen/Qwen3.5-4B
 * Qwen/Qwen3.5-9B
 
-Many of these repos are vision–language on the Hub; `prepare.py` uses `text_config` when present and exports the text transformer only.
+Many of these repos are vision–language. This implementation currently uses the text transformer only
 
-Not supported: MoE checkpoints (e.g. `Qwen3.5-35B-A3B`, `122B-A10B`, `397B-A17B`), FP8 / GPTQ / other non-float weight formats.
+Not supported: MoE models (`Qwen3.5-35B-A3B`, `122B-A10B`, `397B-A17B`...), FP8 / GPTQ / other quantized weight formats
 
 
 ## Build
 
 ```bash
 make          # reference
-make fast     # -Ofast -march=native
+make fast     # -Ofast -march=native (native SIMD when available)
 make omp      # OpenMP (set OMP_NUM_THREADS when running)
 make debug
 make clean
@@ -66,8 +66,9 @@ make clean
 ./qwen35 <model> [options]
 
 # <model> can be a model name (after prepare.py) or a local directory
-./qwen35 Qwen3.5-0.8B -i "Hello!"
-./qwen35 ./Qwen3.5-0.8B -y "You are a helpful assistant."
+./qwen35 Qwen3.5-0.8B
+./qwen35 Qwen/Qwen3.5-2B -y "" -i "Hello!"
+./qwen35 ./Qwen3.5-4B -y "You are a helpful assistant"
 ```
 
 
